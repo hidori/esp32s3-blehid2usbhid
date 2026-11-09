@@ -1,0 +1,21 @@
+board_manager:
+  additional_urls:
+    - https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+library:
+  enable_unsafe_install: false
+
+sketch:
+  always_export_binaries: false
+
+build_cache:
+  compilations_before_purge: 10
+  ttl: 30m
+
+network:
+  connection_timeout: 60m
+
+logging:
+  level: info
+  format: text
