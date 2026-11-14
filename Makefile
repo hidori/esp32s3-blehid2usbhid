@@ -15,7 +15,7 @@ CORES ?= \
 	m5stack:esp32
 
 # Libraries used by the project (e.g. lvgl@8.3.11)
-LIBS ?=
+LIBS ?= "Adafruit TinyUSB Library"
 
 # arduino-cli with the project's configuration file
 ARDUINO_CLI = arduino-cli --config-file arduino-cli.yaml

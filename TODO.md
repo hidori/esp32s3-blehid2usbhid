@@ -4,7 +4,6 @@
 
 ## 未決事項
 
-- USB HID の実装に、コア同梱の USB ライブラリと Adafruit TinyUSB のどちらを使うか
 - GitHub Pages へのデプロイ方法
 - マクロを送ったときに LED で知らせるか
 - 設定用 HID の通信仕様
