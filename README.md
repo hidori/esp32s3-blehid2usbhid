@@ -9,15 +9,15 @@ BLE 接続キーボードを USB 接続で使用するためのブリッジで�
 ├── .claude/                   # Claude Code の設定
 ├── .github/                   # GitHub の設定
 ├── .gitignore                 # git の除外設定
-├── AGENTS.md                  # コーディングエージェント向けの指示（このファイル）
+├── AGENTS.md                  # コーディングエージェント向けの指示
 ├── CLAUDE.md                  # Claude Code 向けの指示
 ├── LICENSE                    # ライセンス条文
 ├── Makefile                   # 作業用のタスク定義
-├── README.md                  # プロジェクトの主旨と概要
+├── README.md                  # プロジェクトの主旨と概要（このファイル）
 ├── SPEC.md                    # プロジェクトターゲットの仕様書
 ├── TODO.md                    # プロジェクトの課題管理
 ├── arduino-cli.yaml           # arduino-cli の設定
-├── compose.yaml               # Docker Compose の設定（設定用 Web ページの配信）
+├── compose.yaml               # Docker Compose の設定
 ├── docs/                      # 設定用 Web ページ
 ├── esp32s3-blehid2usbhid.ino  # スケッチ本体
 ├── mise.toml                  # mise の設定
