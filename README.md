@@ -17,6 +17,8 @@ BLE 接続キーボードを USB 接続で使用するためのブリッジで�
 ├── SPEC.md                    # プロジェクトターゲットの仕様書
 ├── TODO.md                    # プロジェクトの課題管理
 ├── arduino-cli.yaml           # arduino-cli の設定
+├── compose.yaml               # Docker Compose の設定（設定用 Web ページの配信）
+├── docs/                      # 設定用 Web ページ
 ├── esp32s3-blehid2usbhid.ino  # スケッチ本体
 ├── mise.toml                  # mise の設定
 └── renovate.json              # Renovate の設定

@@ -31,7 +31,7 @@ define upload_arduino
 $(ARDUINO_CLI) upload --fqbn $(1) --board-options $(2) --port $(UPLOAD_PORT) --input-dir $(3) .
 endef
 
-.PHONY: all install tools/install core/install lib/install $(addprefix build/,$(BOARDS)) $(addprefix upload/,$(BOARDS)) clean
+.PHONY: all install tools/install core/install lib/install $(addprefix build/,$(BOARDS)) $(addprefix upload/,$(BOARDS)) compose/up compose/down clean
 
 # Default target
 all: $(addprefix build/,$(BOARDS))
@@ -69,6 +69,14 @@ $(addprefix build/,$(BOARDS)): build/%:
 # Upload $(BUILD_DIR) to the board
 $(addprefix upload/,$(BOARDS)): upload/%:
 	$(call upload_arduino,$(FQBN_$*),$(BOARD_OPTIONS_$*),$(BUILD_DIR))
+
+# Start the container serving the settings page (http://localhost:8080/)
+compose/up:
+	docker compose up -d
+
+# Stop and remove the container serving the settings page
+compose/down:
+	docker compose down
 
 # Remove build outputs and installed libraries
 clean:
