@@ -26,12 +26,12 @@ BUILD_DIR = build/$(subst :,.,$(FQBN_$*))
 # Serial port for upload (default: /dev/ttyACM0)
 UPLOAD_PORT ?= /dev/ttyACM0
 
-# Upload <directory> to the board: $(call upload,<fqbn>,<board options>,<directory>)
+# Upload <directory> to the board: $(call upload_arduino,<fqbn>,<board options>,<directory>)
 define upload_arduino
 $(ARDUINO_CLI) upload --fqbn $(1) --board-options $(2) --port $(UPLOAD_PORT) --input-dir $(3) .
 endef
 
-.PHONY: all install tools/install core/install lib/install build $(addprefix build/,$(BOARDS)) $(addprefix upload/,$(BOARDS)) monitor clean
+.PHONY: all install tools/install core/install lib/install $(addprefix build/,$(BOARDS)) $(addprefix upload/,$(BOARDS)) clean
 
 # Default target
 all: $(addprefix build/,$(BOARDS))
