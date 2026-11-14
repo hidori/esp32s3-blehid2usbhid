@@ -7,6 +7,9 @@
 - USB HID の実装に、コア同梱の USB ライブラリと Adafruit TinyUSB のどちらを使うか
 - GitHub Pages へのデプロイ方法
 - マクロを送ったときに LED で知らせるか
+- 設定用 HID の通信仕様
+- BLE の実装に、コア同梱の BLE ライブラリと NimBLE-Arduino のどちらを使うか
+- BLE キーボードのレポートを USB キーボードのレポートに変換する方法（Report Map を解析するか、Boot Protocol を使うか）
 
 ## 保留事項
 
