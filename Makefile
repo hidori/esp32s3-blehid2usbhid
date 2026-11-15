@@ -14,7 +14,7 @@ BOARD_OPTIONS_m5stack-atoms3 = USBMode=default
 CORES ?= \
 	m5stack:esp32
 
-# Libraries used by the project (e.g. lvgl@8.3.11)
+# Libraries used by the project
 LIBS ?= "Adafruit TinyUSB Library"
 
 # arduino-cli with the project's configuration file
