@@ -4,10 +4,13 @@ import { KEY_USAGES } from "./key-usages.js";
 
 const unsupportedMessage = document.getElementById("unsupported");
 const statusText = document.getElementById("status");
-const messageText = document.getElementById("message");
+const deviceText = document.getElementById("device");
+const deviceMessage = document.getElementById("device-message");
+const macroMessage = document.getElementById("macro-message");
 const connectButton = document.getElementById("connect");
 const disconnectButton = document.getElementById("disconnect");
 const restartButton = document.getElementById("restart");
+const macroCard = document.getElementById("macro-card");
 const macroGapInput = document.getElementById("macro-gap");
 const macroKeysBody = document.getElementById("macro-keys");
 const macroAddButton = document.getElementById("macro-add");
@@ -37,14 +40,14 @@ const MACRO_DEFAULT_PRESS_MS = 100;
 
 // Modifier keys in the order of the bits in a macro (see SPEC.md)
 const MODIFIERS = [
-  { label: "左Ctrl", code: "ControlLeft" },
-  { label: "左Shift", code: "ShiftLeft" },
-  { label: "左Alt", code: "AltLeft" },
-  { label: "左GUI", code: "MetaLeft" },
-  { label: "右Ctrl", code: "ControlRight" },
-  { label: "右Shift", code: "ShiftRight" },
-  { label: "右Alt", code: "AltRight" },
-  { label: "右GUI", code: "MetaRight" },
+  { side: "左", name: "Ctrl", code: "ControlLeft" },
+  { side: "左", name: "Shift", code: "ShiftLeft" },
+  { side: "左", name: "Alt", code: "AltLeft" },
+  { side: "左", name: "GUI", code: "MetaLeft" },
+  { side: "右", name: "Ctrl", code: "ControlRight" },
+  { side: "右", name: "Shift", code: "ShiftRight" },
+  { side: "右", name: "Alt", code: "AltRight" },
+  { side: "右", name: "GUI", code: "MetaRight" },
 ];
 
 // KeyboardEvent.code value of each HID usage ID, used as the name of the key
@@ -71,34 +74,44 @@ function hex4(value) {
 
 // Show the connection state on the page
 function render() {
-  if (device) {
-    const name = device.productName || "（製品名なし）";
-    statusText.textContent = `接続中：${name}（${hex4(device.vendorId)}:${hex4(device.productId)}）`;
-  } else {
-    statusText.textContent = "未接続";
-  }
   const connected = device !== null;
+  statusText.textContent = connected ? "接続中" : "未接続";
+  statusText.classList.toggle("connected", connected);
+  if (connected) {
+    const name = device.productName || "（製品名なし）";
+    deviceText.textContent = `${name}（${hex4(device.vendorId)}:${hex4(device.productId)}）`;
+  } else {
+    deviceText.textContent = "";
+  }
   connectButton.disabled = connected;
   disconnectButton.disabled = !connected;
   restartButton.disabled = !connected;
+  // The macro can be read and changed only while connected
+  macroCard.hidden = !connected;
   macroGapInput.disabled = !connected;
   macroAddButton.disabled = !connected || macroRows.length >= MACRO_MAX_KEYS;
   macroSaveButton.disabled = !connected;
 }
 
-// Show the result of an operation on the page
-function showMessage(text) {
-  messageText.textContent = text;
+// Show the result of an operation in the message area of its card (in red if it is an error)
+function showMessage(area, text, isError = false) {
+  area.textContent = text;
+  area.classList.toggle("error", isError);
 }
 
-// Show an error on the page
-function showError(error) {
-  showMessage(`エラー：${error.message}`);
+// Show an error in the message area of a card
+function showError(area, error) {
+  showMessage(area, `エラー：${error.message}`, true);
 }
 
 // Name of a result code in a response
 function resultName(result) {
   return RESULT_NAMES.get(result) ?? `不明な結果（0x${hex2(result)}）`;
+}
+
+// Show the result code of a response to an operation in the message area of its card
+function showResult(area, operation, result) {
+  showMessage(area, `${operation}：${resultName(result)}`, result !== RESULT_SUCCESS);
 }
 
 // Send a request and wait for its response (resolves with the response data without the report ID)
@@ -183,7 +196,7 @@ function listenKeyPress(row) {
     }
     const usage = KEY_USAGES.get(event.code);
     if (usage === undefined) {
-      showMessage(`このキーは指定できません（${event.code || event.key}）`);
+      showMessage(macroMessage, `このキーは指定できません（${event.code || event.key}）`, true);
       return;
     }
     row.keyCode.value = hex2(usage);
@@ -204,24 +217,43 @@ function listenKeyPress(row) {
 function addMacroRow(entry) {
   const tr = document.createElement("tr");
   const numberCell = document.createElement("td");
+  numberCell.className = "number";
 
+  // Modifier keys in 2 lines (left and right), each shown as a toggle button
   const modifierCell = document.createElement("td");
+  const groups = new Map();
   const modifiers = MODIFIERS.map((modifier, bit) => {
+    let group = groups.get(modifier.side);
+    if (!group) {
+      group = document.createElement("div");
+      group.className = "modifier-group";
+      const side = document.createElement("span");
+      side.className = "side";
+      side.textContent = modifier.side;
+      group.append(side);
+      groups.set(modifier.side, group);
+      modifierCell.append(group);
+    }
     const label = document.createElement("label");
+    label.className = "chip";
     const box = document.createElement("input");
     box.type = "checkbox";
     box.checked = (entry.modifiers & (1 << bit)) !== 0;
-    label.append(box, modifier.label);
-    modifierCell.append(label, " ");
+    box.setAttribute("aria-label", `${modifier.side}${modifier.name}`);
+    const name = document.createElement("span");
+    name.textContent = modifier.name;
+    label.append(box, name);
+    group.append(label);
     return box;
   });
 
   const keyName = document.createElement("input");
+  keyName.className = "key-capture";
   keyName.readOnly = true;
   keyName.placeholder = "ここでキーを押す";
 
   const keyCode = document.createElement("input");
-  keyCode.size = 4;
+  keyCode.className = "key-code";
   keyCode.placeholder = "4C";
   keyCode.value = entry.key === null ? "" : hex2(entry.key);
 
@@ -233,6 +265,7 @@ function addMacroRow(entry) {
   press.value = String(entry.pressMs);
 
   const removeButton = document.createElement("button");
+  removeButton.className = "remove";
   removeButton.type = "button";
   removeButton.textContent = "削除";
 
@@ -262,11 +295,12 @@ function addMacroRow(entry) {
   return row;
 }
 
-// Remove the macro from the page
+// Remove the macro from the page (with the message about it)
 function clearMacro() {
   macroRows.length = 0;
   macroKeysBody.replaceChildren();
   macroGapInput.value = "";
+  showMessage(macroMessage, "");
   render();
 }
 
@@ -322,7 +356,7 @@ async function loadMacro() {
 async function saveMacro() {
   const macro = readMacro();
   const response = await request(COMMAND_SET_MACRO, macro);
-  showMessage(`保存：${resultName(response.getUint8(1))}`);
+  showResult(macroMessage, "保存", response.getUint8(1));
 }
 
 // Let the user choose a device, open it and read the macro
@@ -335,8 +369,10 @@ async function connect() {
     await selected.open();
   }
   device = selected;
+  showMessage(deviceMessage, "");
   render();
-  await loadMacro();
+  // An error in reading the macro is shown in the macro card
+  await loadMacro().catch((error) => showError(macroMessage, error));
 }
 
 // Close the opened device
@@ -345,23 +381,24 @@ async function disconnect() {
     await device.close();
   }
   device = null;
+  showMessage(deviceMessage, "");
   clearMacro();
 }
 
 // Restart the device (the device is disconnected after the response)
 async function restart() {
   const response = await request(COMMAND_RESTART);
-  showMessage(`再起動：${resultName(response.getUint8(1))}`);
+  showResult(deviceMessage, "再起動", response.getUint8(1));
 }
 
 if ("hid" in navigator) {
-  connectButton.addEventListener("click", () => connect().catch(showError));
-  disconnectButton.addEventListener("click", () => disconnect().catch(showError));
-  restartButton.addEventListener("click", () => restart().catch(showError));
+  connectButton.addEventListener("click", () => connect().catch((error) => showError(deviceMessage, error)));
+  disconnectButton.addEventListener("click", () => disconnect().catch((error) => showError(deviceMessage, error)));
+  restartButton.addEventListener("click", () => restart().catch((error) => showError(deviceMessage, error)));
   macroAddButton.addEventListener("click", () => {
     addMacroRow({ modifiers: 0, key: null, pressMs: MACRO_DEFAULT_PRESS_MS }).keyName.focus();
   });
-  macroSaveButton.addEventListener("click", () => saveMacro().catch(showError));
+  macroSaveButton.addEventListener("click", () => saveMacro().catch((error) => showError(macroMessage, error)));
   // The device was unplugged
   navigator.hid.addEventListener("disconnect", (event) => {
     if (event.device === device) {

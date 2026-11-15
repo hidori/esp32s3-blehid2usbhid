@@ -4,35 +4,61 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ESP32-S3 BLE HID to USB HID Bridge</title>
+  <link rel="stylesheet" href="style.css">
   <script type="module" src="main.js"></script>
 </head>
 <body>
-  <h1>ESP32-S3 BLE HID to USB HID Bridge</h1>
-  <p id="unsupported" hidden>このブラウザは WebHID に対応していません。デスクトップ版の Chrome か Edge で開いてください。</p>
-  <p>状態：<span id="status">未接続</span></p>
-  <button id="connect" type="button">接続</button>
-  <button id="disconnect" type="button" disabled>切断</button>
-  <button id="restart" type="button" disabled>再起動</button>
-  <p id="message"></p>
+  <header class="page-header">
+    <h1>ESP32-S3 BLE HID to USB HID Bridge</h1>
+    <p class="status-line">
+      <span id="status" class="badge">未接続</span>
+      <span id="device"></span>
+    </p>
+  </header>
 
-  <h2>マクロ</h2>
-  <p>
-    <label>キーとキーの間の時間（ms）：<input id="macro-gap" type="number" min="0" max="5000" step="1" disabled></label>
-  </p>
-  <table>
-    <thead>
-      <tr>
-        <th>#</th>
-        <th>修飾キー</th>
-        <th>キー（欄を選んで押す）</th>
-        <th>コード（16 進数）</th>
-        <th>押している時間（ms）</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="macro-keys"></tbody>
-  </table>
-  <button id="macro-add" type="button" disabled>追加</button>
-  <button id="macro-save" type="button" disabled>保存</button>
+  <main>
+    <p id="unsupported" class="banner" hidden>このブラウザは WebHID に対応していません。デスクトップ版の Chrome か Edge で開いてください。</p>
+
+    <details class="card" open>
+      <summary><h2>デバイス</h2></summary>
+      <div class="actions">
+        <button id="connect" class="primary" type="button">接続</button>
+        <button id="disconnect" type="button" disabled>切断</button>
+      </div>
+      <div class="card-footer">
+        <p id="device-message" class="message"></p>
+        <button id="restart" type="button" disabled>再起動</button>
+      </div>
+    </details>
+
+    <details id="macro-card" class="card" open hidden>
+      <summary><h2>マクロ</h2></summary>
+      <div class="field">
+        <label for="macro-gap">キーとキーの間の時間</label>
+        <input id="macro-gap" type="number" min="0" max="5000" step="1" disabled>
+        <span class="unit">ms</span>
+      </div>
+      <div class="table-wrap">
+        <table class="macro">
+          <thead>
+            <tr>
+              <th class="number">#</th>
+              <th>修飾キー</th>
+              <th>キー（欄を選んで押す）</th>
+              <th>コード（16 進数）</th>
+              <th>押している時間（ms）</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="macro-keys"></tbody>
+        </table>
+      </div>
+      <button id="macro-add" class="add-row" type="button" disabled>＋ 追加</button>
+      <div class="card-footer">
+        <p id="macro-message" class="message"></p>
+        <button id="macro-save" class="primary" type="button" disabled>保存</button>
+      </div>
+    </details>
+  </main>
 </body>
 </html>
