@@ -14,5 +14,25 @@
   <button id="disconnect" type="button" disabled>切断</button>
   <button id="restart" type="button" disabled>再起動</button>
   <p id="message"></p>
+
+  <h2>マクロ</h2>
+  <p>
+    <label>キーとキーの間の時間（ms）：<input id="macro-gap" type="number" min="0" max="5000" step="1" disabled></label>
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>修飾キー</th>
+        <th>キー（欄を選んで押す）</th>
+        <th>コード（16 進数）</th>
+        <th>押している時間（ms）</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="macro-keys"></tbody>
+  </table>
+  <button id="macro-add" type="button" disabled>追加</button>
+  <button id="macro-save" type="button" disabled>保存</button>
 </body>
 </html>

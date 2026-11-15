@@ -1,7 +1,9 @@
 // BLE HID to USB HID bridge
 
 #include <Adafruit_TinyUSB.h>
+#include <Preferences.h>
 #include <esp_mac.h>
+#include <nvs_flash.h>
 
 // Main button (LOW while pressed)
 const uint8_t PIN_BUTTON = 41;
@@ -10,8 +12,27 @@ const uint8_t PIN_BUTTON = 41;
 const uint8_t SETTINGS_REPORT_ID = 2;
 const uint8_t SETTINGS_REPORT_SIZE = 63;
 const uint8_t COMMAND_RESTART = 0x01;
+const uint8_t COMMAND_GET_MACRO = 0x02;
+const uint8_t COMMAND_SET_MACRO = 0x03;
 const uint8_t RESULT_SUCCESS = 0x00;
 const uint8_t RESULT_UNKNOWN_COMMAND = 0x01;
+const uint8_t RESULT_INVALID_ARGUMENT = 0x02;
+const uint8_t RESULT_SAVE_FAILED = 0x03;
+
+// Macro data (see SPEC.md)
+const uint8_t MACRO_MAX_KEYS = 10;
+const uint16_t MACRO_MAX_TIME_MS = 5000;
+const uint16_t MACRO_DEFAULT_GAP_MS = 100;
+const size_t MACRO_HEADER_SIZE = 3;
+const size_t MACRO_ENTRY_SIZE = 4;
+const size_t MACRO_MAX_SIZE = MACRO_HEADER_SIZE + MACRO_ENTRY_SIZE * MACRO_MAX_KEYS;
+static_assert(MACRO_MAX_SIZE <= SETTINGS_REPORT_SIZE - 2, "the macro must fit in a response");
+
+// NVS (the ID marks that the NVS has been initialized by this firmware)
+const char NVS_NAMESPACE[] = "settings";
+const char NVS_KEY_ID[] = "id";
+const char NVS_KEY_MACRO[] = "macro";
+const uint32_t NVS_ID = 0xB1E2B5B0;
 
 // Keyboard (boot protocol, no report ID so that boot and report protocol share the format)
 uint8_t const descKeyboard[] = {TUD_HID_REPORT_DESC_KEYBOARD()};
@@ -34,6 +55,10 @@ static uint8_t ledState;
 // Requests from the settings page, passed from the USB task to loop()
 static QueueHandle_t settingsRequests;
 
+// Current macro in the format of SPEC.md
+static uint8_t macro[MACRO_MAX_SIZE];
+static size_t macroSize;
+
 // Output report from the host (Caps Lock etc.)
 void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
   if (type == HID_REPORT_TYPE_OUTPUT && size >= 1) {
@@ -49,6 +74,97 @@ void settingsSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *
   uint8_t request[SETTINGS_REPORT_SIZE] = {};
   memcpy(request, buffer, size < sizeof(request) ? size : sizeof(request));
   xQueueSend(settingsRequests, request, 0);
+}
+
+// Read a little-endian 16-bit value
+static uint16_t readU16(uint8_t const *p) {
+  return p[0] | (p[1] << 8);
+}
+
+// Whether the key is a usage ID allowed in a macro (see SPEC.md)
+static bool isValidKey(uint8_t key) {
+  return (key >= 0x04 && key <= 0xA4) || (key >= 0xB0 && key <= 0xDD);
+}
+
+// Whether the data is a macro in the format of SPEC.md
+static bool isValidMacro(uint8_t const *data, size_t size) {
+  if (size < MACRO_HEADER_SIZE) {
+    return false;
+  }
+  uint8_t count = data[2];
+  if (count > MACRO_MAX_KEYS || size != MACRO_HEADER_SIZE + MACRO_ENTRY_SIZE * count) {
+    return false;
+  }
+  if (readU16(data) > MACRO_MAX_TIME_MS) {
+    return false;
+  }
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t const *entry = data + MACRO_HEADER_SIZE + MACRO_ENTRY_SIZE * i;
+    if (!isValidKey(entry[1]) || readU16(entry + 2) > MACRO_MAX_TIME_MS) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Make the NVS hold only the data of this firmware: erase it on the first run (when the ID is missing)
+static bool initNvs() {
+  Preferences prefs;
+  uint32_t id = 0;
+  if (prefs.begin(NVS_NAMESPACE, true)) {
+    id = prefs.getUInt(NVS_KEY_ID, 0);
+    prefs.end();
+  }
+  if (id == NVS_ID) {
+    return true;
+  }
+  if (nvs_flash_erase() != ESP_OK || nvs_flash_init() != ESP_OK) {
+    return false;
+  }
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    return false;
+  }
+  bool written = prefs.putUInt(NVS_KEY_ID, NVS_ID) == sizeof(uint32_t);
+  prefs.end();
+  return written;
+}
+
+// Load the macro from the NVS (no macro registered if it is missing or broken)
+static void loadMacro(bool nvsReady) {
+  macro[0] = MACRO_DEFAULT_GAP_MS & 0xFF;
+  macro[1] = MACRO_DEFAULT_GAP_MS >> 8;
+  macro[2] = 0;
+  macroSize = MACRO_HEADER_SIZE;
+  if (!nvsReady) {
+    return;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, true)) {
+    return;
+  }
+  uint8_t data[MACRO_MAX_SIZE];
+  size_t size = prefs.getBytes(NVS_KEY_MACRO, data, sizeof(data));
+  prefs.end();
+  if (isValidMacro(data, size)) {
+    memcpy(macro, data, size);
+    macroSize = size;
+  }
+}
+
+// Save the macro to the NVS and use it
+static bool saveMacro(uint8_t const *data, size_t size) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    return false;
+  }
+  bool saved = prefs.putBytes(NVS_KEY_MACRO, data, size) == size;
+  prefs.end();
+  if (saved) {
+    memcpy(macro, data, size);
+    macroSize = size;
+  }
+  return saved;
 }
 
 // Wait until the HID interface can send a report (gives up after about 100 ms)
@@ -76,12 +192,28 @@ static void sendKey(uint8_t keycode) {
 }
 
 // Send a response to the settings page
-static void sendSettingsResponse(uint8_t command, uint8_t result) {
+static void sendSettingsResponse(uint8_t command, uint8_t result, uint8_t const *data, size_t size) {
   uint8_t response[SETTINGS_REPORT_SIZE] = {command, result};
+  if (size > 0) {
+    memcpy(response + 2, data, size);
+  }
   if (!waitReady(settings)) {
     return;
   }
   settings.sendReport(SETTINGS_REPORT_ID, response, sizeof(response));
+}
+
+// Set the macro from the arguments of the request
+static uint8_t setMacro(uint8_t const *args) {
+  uint8_t count = args[2];
+  if (count > MACRO_MAX_KEYS) {
+    return RESULT_INVALID_ARGUMENT;
+  }
+  size_t size = MACRO_HEADER_SIZE + MACRO_ENTRY_SIZE * count;
+  if (!isValidMacro(args, size)) {
+    return RESULT_INVALID_ARGUMENT;
+  }
+  return saveMacro(args, size) ? RESULT_SUCCESS : RESULT_SAVE_FAILED;
 }
 
 // Handle a request from the settings page
@@ -89,18 +221,28 @@ static void handleSettingsRequest(uint8_t const *request) {
   uint8_t command = request[0];
   switch (command) {
     case COMMAND_RESTART:
-      sendSettingsResponse(command, RESULT_SUCCESS);
+      sendSettingsResponse(command, RESULT_SUCCESS, NULL, 0);
       // Wait until the host has received the response
       waitReady(settings);
       ESP.restart();
       break;
+    case COMMAND_GET_MACRO:
+      sendSettingsResponse(command, RESULT_SUCCESS, macro, macroSize);
+      break;
+    case COMMAND_SET_MACRO:
+      sendSettingsResponse(command, setMacro(request + 1), NULL, 0);
+      break;
     default:
-      sendSettingsResponse(command, RESULT_UNKNOWN_COMMAND);
+      sendSettingsResponse(command, RESULT_UNKNOWN_COMMAND, NULL, 0);
       break;
   }
 }
 
 void setup() {
+  // Before anything else uses the NVS
+  bool nvsReady = initNvs();
+  loadMacro(nvsReady);
+
   pinMode(PIN_BUTTON, INPUT_PULLUP);
 
   settingsRequests = xQueueCreate(4, SETTINGS_REPORT_SIZE);
