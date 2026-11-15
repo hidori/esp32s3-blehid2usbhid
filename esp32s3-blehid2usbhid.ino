@@ -6,23 +6,20 @@
 // Main button (LOW while pressed)
 const uint8_t PIN_BUTTON = 41;
 
+// Settings HID protocol (see SPEC.md)
+const uint8_t SETTINGS_REPORT_ID = 2;
+const uint8_t SETTINGS_REPORT_SIZE = 63;
+const uint8_t COMMAND_RESTART = 0x01;
+const uint8_t RESULT_SUCCESS = 0x00;
+const uint8_t RESULT_UNKNOWN_COMMAND = 0x01;
+
 // Keyboard (boot protocol, no report ID so that boot and report protocol share the format)
 uint8_t const descKeyboard[] = {TUD_HID_REPORT_DESC_KEYBOARD()};
 
-// Consumer control (report ID 1) and vendor-defined settings collection (report ID 2)
+// Consumer control (report ID 1) and vendor-defined settings collection (input and output reports)
 uint8_t const descSettings[] = {
     TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(1)),
-    HID_USAGE_PAGE_N(HID_USAGE_PAGE_VENDOR, 2),
-    HID_USAGE(0x01),
-    HID_COLLECTION(HID_COLLECTION_APPLICATION),
-      HID_REPORT_ID(2)
-      HID_USAGE(0x02),
-      HID_LOGICAL_MIN(0x00),
-      HID_LOGICAL_MAX_N(0xff, 2),
-      HID_REPORT_SIZE(8),
-      HID_REPORT_COUNT(63),
-      HID_FEATURE(HID_DATA | HID_VARIABLE | HID_ABSOLUTE),
-    HID_COLLECTION_END,
+    TUD_HID_REPORT_DESC_GENERIC_INOUT(SETTINGS_REPORT_SIZE, HID_REPORT_ID(SETTINGS_REPORT_ID)),
 };
 
 Adafruit_USBD_HID keyboard;
@@ -34,8 +31,8 @@ static char productName[40];
 // Lamp state (Caps Lock etc.) received from the host
 static uint8_t ledState;
 
-// Feature report buffer of the settings collection
-static uint8_t feature[63];
+// Requests from the settings page, passed from the USB task to loop()
+static QueueHandle_t settingsRequests;
 
 // Output report from the host (Caps Lock etc.)
 void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
@@ -44,27 +41,20 @@ void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *
   }
 }
 
-// Feature report get (device -> host)
-uint16_t settingsGetReport(uint8_t reportId, hid_report_type_t type, uint8_t *buffer, uint16_t reqlen) {
-  if (type != HID_REPORT_TYPE_FEATURE || reportId != 2) {
-    return 0;
-  }
-  uint16_t len = reqlen < sizeof(feature) ? reqlen : sizeof(feature);
-  memcpy(buffer, feature, len);
-  return len;
-}
-
-// Feature report set (host -> device)
+// Output report from the settings page (runs in the USB task, so only queue the request here)
 void settingsSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
-  if (type == HID_REPORT_TYPE_FEATURE && reportId == 2) {
-    memcpy(feature, buffer, size < sizeof(feature) ? size : sizeof(feature));
+  if (type != HID_REPORT_TYPE_OUTPUT || reportId != SETTINGS_REPORT_ID) {
+    return;
   }
+  uint8_t request[SETTINGS_REPORT_SIZE] = {};
+  memcpy(request, buffer, size < sizeof(request) ? size : sizeof(request));
+  xQueueSend(settingsRequests, request, 0);
 }
 
-// Wait until the keyboard can send a report (gives up after about 100 ms)
-static bool waitKeyboardReady() {
+// Wait until the HID interface can send a report (gives up after about 100 ms)
+static bool waitReady(Adafruit_USBD_HID &hid) {
   for (int i = 0; i < 100; i++) {
-    if (keyboard.ready()) {
+    if (hid.ready()) {
       return true;
     }
     delay(1);
@@ -75,18 +65,45 @@ static bool waitKeyboardReady() {
 // Send a key once (press and release)
 static void sendKey(uint8_t keycode) {
   uint8_t keys[6] = {keycode, 0, 0, 0, 0, 0};
-  if (!waitKeyboardReady()) {
+  if (!waitReady(keyboard)) {
     return;
   }
   keyboard.keyboardReport(0, 0, keys);
-  if (!waitKeyboardReady()) {
+  if (!waitReady(keyboard)) {
     return;
   }
   keyboard.keyboardRelease(0);
 }
 
+// Send a response to the settings page
+static void sendSettingsResponse(uint8_t command, uint8_t result) {
+  uint8_t response[SETTINGS_REPORT_SIZE] = {command, result};
+  if (!waitReady(settings)) {
+    return;
+  }
+  settings.sendReport(SETTINGS_REPORT_ID, response, sizeof(response));
+}
+
+// Handle a request from the settings page
+static void handleSettingsRequest(uint8_t const *request) {
+  uint8_t command = request[0];
+  switch (command) {
+    case COMMAND_RESTART:
+      sendSettingsResponse(command, RESULT_SUCCESS);
+      // Wait until the host has received the response
+      waitReady(settings);
+      ESP.restart();
+      break;
+    default:
+      sendSettingsResponse(command, RESULT_UNKNOWN_COMMAND);
+      break;
+  }
+}
+
 void setup() {
   pinMode(PIN_BUTTON, INPUT_PULLUP);
+
+  settingsRequests = xQueueCreate(4, SETTINGS_REPORT_SIZE);
 
   uint8_t mac[6];
   esp_efuse_mac_get_default(mac);
@@ -105,7 +122,7 @@ void setup() {
 
   settings.setReportDescriptor(descSettings, sizeof(descSettings));
   settings.setStringDescriptor(productName);
-  settings.setReportCallback(settingsGetReport, settingsSetReport);
+  settings.setReportCallback(NULL, settingsSetReport);
   settings.begin();
 
   // USB has already started before setup() (CDC on boot), so re-enumerate to apply the settings above
@@ -117,6 +134,11 @@ void setup() {
 }
 
 void loop() {
+  uint8_t request[SETTINGS_REPORT_SIZE];
+  if (xQueueReceive(settingsRequests, request, 0) == pdTRUE) {
+    handleSettingsRequest(request);
+  }
+
   // Send the key once when the button is pressed (polled every 10 ms, no debounce yet)
   static int lastButton = HIGH;
   int button = digitalRead(PIN_BUTTON);
