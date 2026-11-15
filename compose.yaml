@@ -5,3 +5,48 @@ services:
       - "127.0.0.1:8080:80"
     volumes:
       - ./docs:/usr/share/nginx/html:ro
+
+  # Gateway to the MCP servers on the isolated networks (published only on 127.0.0.1)
+  mcp-gateway:
+    image: nginx:1.31.8-alpine
+    ports:
+      - "127.0.0.1:8931:8080"
+    networks:
+      - default
+      - mcp-playwright
+    volumes:
+      - ./.devcontainer/mcp/gateway/default.conf:/etc/nginx/conf.d/default.conf:ro
+
+  # Playwright MCP server, with a stub of the device in place of WebHID
+  mcp-playwright:
+    image: mcr.microsoft.com/playwright/mcp:v0.0.85
+    networks:
+      - mcp-playwright
+    init: true
+    volumes:
+      - ./.devcontainer/mcp/playwright/hid-stub.js:/opt/hid-stub.js:ro
+    entrypoint: ["node", "/app/cli.js"]
+    command:
+      - --headless
+      - --browser
+      - chromium
+      - --no-sandbox
+      - --port
+      - "8931"
+      - --host
+      - 0.0.0.0
+      - --isolated
+      - --init-script
+      - /opt/hid-stub.js
+
+  # Serves docs/ on localhost in the network of mcp-playwright (WebHID needs a secure context)
+  mcp-playwright-docs:
+    image: nginx:1.31.8-alpine
+    network_mode: "service:mcp-playwright"
+    volumes:
+      - ./docs:/usr/share/nginx/html:ro
+
+networks:
+  # The MCP server cannot communicate with the outside (only with mcp-gateway)
+  mcp-playwright:
+    internal: true

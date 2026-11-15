@@ -7,8 +7,10 @@ BLE 接続キーボードを USB 接続で使用するためのブリッジで�
 ```text
 .
 ├── .claude/                   # Claude Code の設定
+├── .devcontainer/             # 開発用コンテナの設定
 ├── .github/                   # GitHub の設定
 ├── .gitignore                 # git の除外設定
+├── .mcp.json                  # MCP サーバーの設定
 ├── AGENTS.md                  # コーディングエージェント向けの指示
 ├── CLAUDE.md                  # Claude Code 向けの指示
 ├── LICENSE                    # ライセンス条文
