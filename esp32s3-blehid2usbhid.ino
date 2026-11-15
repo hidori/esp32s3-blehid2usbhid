@@ -117,7 +117,7 @@ void setup() {
 }
 
 void loop() {
-  // Send the key once when the button is pressed (the 10 ms period also filters out chattering)
+  // Send the key once when the button is pressed (polled every 10 ms, no debounce yet)
   static int lastButton = HIGH;
   int button = digitalRead(PIN_BUTTON);
   if (lastButton == HIGH && button == LOW) {
