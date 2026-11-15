@@ -8,6 +8,13 @@
 // Main button (LOW while pressed)
 const uint8_t PIN_BUTTON = 41;
 
+// Time for which the button must stay in a new state before the state is accepted (debounce).
+// Most switches bounce well under 10 ms, so 20 ms is conservative (Jack G. Ganssle, "A Guide to Debouncing")
+const uint32_t BUTTON_DEBOUNCE_MS = 20;
+
+// Interval of loop(), which is also the resolution of the times in a macro
+const uint32_t LOOP_INTERVAL_MS = 1;
+
 // Settings HID protocol (see SPEC.md)
 const uint8_t SETTINGS_REPORT_ID = 2;
 const uint8_t SETTINGS_REPORT_SIZE = 63;
@@ -58,6 +65,18 @@ static QueueHandle_t settingsRequests;
 // Current macro in the format of SPEC.md
 static uint8_t macro[MACRO_MAX_SIZE];
 static size_t macroSize;
+
+// Sending of the macro, which proceeds a step at a time in loop() so that the settings page is answered meanwhile
+enum MacroSendState : uint8_t {
+  MACRO_SEND_IDLE,   // Not sending
+  MACRO_SEND_PRESS,  // Pressing the key (waiting until the report can be sent)
+  MACRO_SEND_HOLD,   // Holding the key until its press time passes
+  MACRO_SEND_GAP,    // Waiting for the time between the keys
+};
+static MacroSendState macroSendState = MACRO_SEND_IDLE;
+static uint8_t sendingMacro[MACRO_MAX_SIZE];  // Copy of the macro when the sending started
+static uint8_t sendingIndex;                  // Index of the key being sent
+static uint32_t sendingSinceMs;               // When the current step started
 
 // Output report from the host (Caps Lock etc.)
 void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
@@ -178,17 +197,74 @@ static bool waitReady(Adafruit_USBD_HID &hid) {
   return false;
 }
 
-// Send a key once (press and release)
-static void sendKey(uint8_t keycode) {
-  uint8_t keys[6] = {keycode, 0, 0, 0, 0, 0};
-  if (!waitReady(keyboard)) {
+// Whether the main button has just been pressed (debounced, true once per press)
+static bool buttonPressed() {
+  static int rawState = HIGH;
+  static int stableState = HIGH;
+  static uint32_t rawChangedMs = 0;
+  int state = digitalRead(PIN_BUTTON);
+  uint32_t now = millis();
+  if (state != rawState) {
+    rawState = state;
+    rawChangedMs = now;
+    return false;
+  }
+  if (state != stableState && now - rawChangedMs >= BUTTON_DEBOUNCE_MS) {
+    stableState = state;
+    return stableState == LOW;
+  }
+  return false;
+}
+
+// Start sending the macro once (nothing if no macro is registered or the host is not ready)
+static void startMacro() {
+  if (macro[2] == 0 || !TinyUSBDevice.ready()) {
     return;
   }
-  keyboard.keyboardReport(0, 0, keys);
-  if (!waitReady(keyboard)) {
+  memcpy(sendingMacro, macro, macroSize);
+  sendingIndex = 0;
+  macroSendState = MACRO_SEND_PRESS;
+}
+
+// Proceed with sending the macro (see SPEC.md for the times)
+static void updateMacro() {
+  if (macroSendState == MACRO_SEND_IDLE) {
     return;
   }
-  keyboard.keyboardRelease(0);
+  // Stop if the host is gone or suspended
+  if (!TinyUSBDevice.ready()) {
+    macroSendState = MACRO_SEND_IDLE;
+    return;
+  }
+
+  uint8_t const *entry = sendingMacro + MACRO_HEADER_SIZE + MACRO_ENTRY_SIZE * sendingIndex;
+  uint32_t now = millis();
+  switch (macroSendState) {
+    case MACRO_SEND_PRESS:
+      if (keyboard.ready()) {
+        uint8_t keys[6] = {entry[1], 0, 0, 0, 0, 0};
+        keyboard.keyboardReport(0, entry[0], keys);
+        sendingSinceMs = now;
+        macroSendState = MACRO_SEND_HOLD;
+      }
+      break;
+    case MACRO_SEND_HOLD:
+      if (now - sendingSinceMs >= readU16(entry + 2) && keyboard.ready()) {
+        keyboard.keyboardRelease(0);
+        sendingSinceMs = now;
+        sendingIndex++;
+        macroSendState = sendingIndex < sendingMacro[2] ? MACRO_SEND_GAP : MACRO_SEND_IDLE;
+      }
+      break;
+    case MACRO_SEND_GAP:
+      // The time between the keys runs from the release of a key to the press of the next key
+      if (now - sendingSinceMs >= readU16(sendingMacro)) {
+        macroSendState = MACRO_SEND_PRESS;
+      }
+      break;
+    default:
+      break;
+  }
 }
 
 // Send a response to the settings page
@@ -281,12 +357,11 @@ void loop() {
     handleSettingsRequest(request);
   }
 
-  // Send the key once when the button is pressed (polled every 10 ms, no debounce yet)
-  static int lastButton = HIGH;
-  int button = digitalRead(PIN_BUTTON);
-  if (lastButton == HIGH && button == LOW) {
-    sendKey(HID_KEY_A);
+  // Send the macro once each time the button is pressed (a press while sending is ignored, see SPEC.md)
+  if (buttonPressed() && macroSendState == MACRO_SEND_IDLE) {
+    startMacro();
   }
-  lastButton = button;
-  delay(10);
+  updateMacro();
+
+  delay(LOOP_INTERVAL_MS);
 }
