@@ -11,8 +11,6 @@
   const REPORT_ID = 2;
   const REPORT_SIZE = 63;
   const COMMAND_RESTART = 0x01;
-  const COMMAND_GET_MACRO = 0x02;
-  const COMMAND_SET_MACRO = 0x03;
   const COMMAND_START_SCAN = 0x04;
   const COMMAND_STOP_SCAN = 0x05;
   const COMMAND_GET_SCAN_RESULT = 0x06;
@@ -34,15 +32,6 @@
   // Time until a response arrives, and until the device is disconnected by a restart
   const RESPONSE_DELAY_MS = 10;
   const RESTART_DELAY_MS = 100;
-
-  // Macro kept until the page is reloaded (it survives a restart like the NVS).
-  // At first, the example in SPEC.md: DEL, F1 and F2, 100 ms each, 100 ms between the keys
-  let macro = new Uint8Array([
-    100, 0, 3,
-    0x00, 0x4c, 100, 0,
-    0x00, 0x3a, 100, 0,
-    0x00, 0x3b, 100, 0,
-  ]);
 
   // BLE keyboards found by the search, each after the time from the start of the search, and how the pairing with
   // each goes (see PAIRING_TIMELINES). The addresses are little endian as in the scan result (the first one is shown
@@ -233,15 +222,6 @@
           this.respond(command, RESULT_SUCCESS);
           setTimeout(() => this.disconnect(), RESTART_DELAY_MS);
           break;
-        case COMMAND_GET_MACRO:
-          this.respond(command, RESULT_SUCCESS, macro);
-          break;
-        case COMMAND_SET_MACRO: {
-          const count = request[1 + 2];
-          macro = request.slice(1, 1 + 3 + 4 * count);
-          this.respond(command, RESULT_SUCCESS);
-          break;
-        }
         case COMMAND_START_SCAN:
           // Not while pairing, like the firmware
           if (isPairing()) {

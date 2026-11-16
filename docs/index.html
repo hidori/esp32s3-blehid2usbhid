@@ -61,35 +61,6 @@
       </div>
       <p id="keyboard-message" class="message"></p>
     </details>
-
-    <details id="macro-card" class="card" open hidden>
-      <summary><h2>マクロ</h2></summary>
-      <div class="field">
-        <label for="macro-gap">キーとキーの間の時間</label>
-        <input id="macro-gap" type="number" min="0" max="5000" step="1" disabled>
-        <span class="unit">ms</span>
-      </div>
-      <div class="table-wrap">
-        <table class="macro">
-          <thead>
-            <tr>
-              <th class="number">#</th>
-              <th>修飾キー</th>
-              <th>キー（欄を選んで押す）</th>
-              <th>コード（16 進数）</th>
-              <th>押している時間（ms）</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="macro-keys"></tbody>
-        </table>
-      </div>
-      <button id="macro-add" class="add-row" type="button" disabled>＋ 追加</button>
-      <div class="card-footer">
-        <p id="macro-message" class="message"></p>
-        <button id="macro-save" class="primary" type="button" disabled>保存</button>
-      </div>
-    </details>
   </main>
 </body>
 </html>

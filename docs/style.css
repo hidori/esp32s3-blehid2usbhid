@@ -7,7 +7,6 @@
   --text: #1f2328;
   --muted: #59636e;
   --border: #d1d9e0;
-  --field-bg: #ffffff;
   --button-bg: #f6f8fa;
   --button-hover: #eaeef2;
   --accent: #0969da;
@@ -17,7 +16,6 @@
   --neutral-soft: #eef1f4;
   --success: #1a7f37;
   --success-soft: #dafbe1;
-  --danger: #cf222e;
   --danger-soft: #ffebe9;
   --danger-border: #ff818266;
   --warning-bg: #fff8c5;
@@ -31,7 +29,6 @@
     --text: #e6edf3;
     --muted: #9198a1;
     --border: #3d444d;
-    --field-bg: #0d1117;
     --button-bg: #21262d;
     --button-hover: #2a313c;
     --accent: #1f6feb;
@@ -41,7 +38,6 @@
     --neutral-soft: #262c36;
     --success: #3fb950;
     --success-soft: #2ea04326;
-    --danger: #f85149;
     --danger-soft: #f851491a;
     --danger-border: #f8514966;
     --warning-bg: #bb800926;
@@ -265,87 +261,12 @@ button:disabled {
   cursor: not-allowed;
 }
 
-button.remove {
-  height: 2rem;
-  min-width: 0;
-  padding: 0 0.625rem;
-  border-color: transparent;
-  background: transparent;
-  color: var(--muted);
-  font-size: 0.8125rem;
-}
-
-button.remove:hover:not(:disabled) {
-  background: var(--danger-soft);
-  color: var(--danger);
-}
-
-/* Adds a row to the table right above it */
-button.add-row {
-  height: 2rem;
-  min-width: 0;
-  margin-top: 0.5rem;
-  padding: 0 0.75rem;
-  border-style: dashed;
-  background: transparent;
-  color: var(--accent);
-  font-size: 0.875rem;
-}
-
-button.add-row:hover:not(:disabled) {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
-
 button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
-/* Input fields */
-
-input:not([type="checkbox"]) {
-  box-sizing: border-box;
-  height: 2.25rem;
-  padding: 0 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--field-bg);
-  color: var(--text);
-  font: inherit;
-}
-
-input:not([type="checkbox"]):focus {
-  border-color: var(--accent);
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-
-input:disabled {
-  opacity: 0.5;
-}
-
-input::placeholder {
-  color: var(--muted);
-}
-
-input[type="number"] {
-  width: 6rem;
-  text-align: right;
-}
-
-.field {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
-}
-
-.unit {
-  color: var(--muted);
-}
-
-/* Tables (macro and search result) */
+/* Search result table */
 
 .table-wrap {
   overflow-x: auto;
@@ -355,13 +276,11 @@ input[type="number"] {
   margin-top: 1rem;
 }
 
-.macro,
 .devices {
   width: 100%;
   border-collapse: collapse;
 }
 
-.macro th,
 .devices th {
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
@@ -372,14 +291,12 @@ input[type="number"] {
   white-space: nowrap;
 }
 
-.macro td,
 .devices td {
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
 
-.macro tbody tr:last-child td,
 .devices tbody tr:last-child td {
   border-bottom: none;
 }
@@ -442,90 +359,4 @@ button.row-action {
 .pairing-hint {
   color: var(--muted);
   font-size: 0.875rem;
-}
-
-.macro .number {
-  width: 2em;
-  color: var(--muted);
-  text-align: right;
-}
-
-.macro input:not([type="checkbox"]) {
-  height: 2rem;
-}
-
-/* The field that waits for a key press: highlighted while it is selected */
-.key-capture {
-  width: 11rem;
-  caret-color: transparent;
-  cursor: pointer;
-}
-
-.key-capture:focus {
-  background: var(--accent-soft);
-}
-
-.key-code {
-  width: 4rem;
-  font-family: ui-monospace, Consolas, monospace;
-}
-
-/* Modifier keys: a checkbox shown as a toggle button */
-
-.modifier-group {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-  white-space: nowrap;
-}
-
-.modifier-group + .modifier-group {
-  margin-top: 0.25rem;
-}
-
-.side {
-  width: 1.5em;
-  color: var(--muted);
-  font-size: 0.8125rem;
-}
-
-.chip {
-  position: relative;
-  display: inline-flex;
-}
-
-.chip input {
-  position: absolute;
-  inset: 0;
-  margin: 0;
-  opacity: 0;
-  cursor: pointer;
-}
-
-.chip span {
-  min-width: 3.25em;
-  padding: 0 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--button-bg);
-  color: var(--muted);
-  font-size: 0.8125rem;
-  line-height: 1.625rem;
-  text-align: center;
-  user-select: none;
-}
-
-.chip:hover span {
-  border-color: var(--accent);
-}
-
-.chip input:checked + span {
-  border-color: var(--accent);
-  background: var(--accent);
-  color: var(--accent-text);
-}
-
-.chip input:focus-visible + span {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
 }
