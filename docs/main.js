@@ -10,6 +10,11 @@ const macroMessage = document.getElementById("macro-message");
 const connectButton = document.getElementById("connect");
 const disconnectButton = document.getElementById("disconnect");
 const restartButton = document.getElementById("restart");
+const keyboardCard = document.getElementById("keyboard-card");
+const keyboardMessage = document.getElementById("keyboard-message");
+const scanButton = document.getElementById("scan");
+const scanResults = document.getElementById("scan-results");
+const scanDevicesBody = document.getElementById("scan-devices");
 const macroCard = document.getElementById("macro-card");
 const macroGapInput = document.getElementById("macro-gap");
 const macroKeysBody = document.getElementById("macro-keys");
@@ -25,12 +30,16 @@ const REPORT_SIZE = 63;
 const COMMAND_RESTART = 0x01;
 const COMMAND_GET_MACRO = 0x02;
 const COMMAND_SET_MACRO = 0x03;
+const COMMAND_START_SCAN = 0x04;
+const COMMAND_STOP_SCAN = 0x05;
+const COMMAND_GET_SCAN_RESULT = 0x06;
 const RESULT_SUCCESS = 0x00;
 const RESULT_NAMES = new Map([
   [0x00, "成功"],
   [0x01, "不明なコマンド"],
   [0x02, "引数が不正"],
   [0x03, "保存に失敗"],
+  [0x04, "BLE の操作に失敗"],
 ]);
 
 // Macro (see SPEC.md)
@@ -56,8 +65,18 @@ const KEY_NAMES = new Map([...KEY_USAGES].map(([code, usage]) => [usage, code]))
 // Time to wait for a response from the device
 const RESPONSE_TIMEOUT_MS = 1000;
 
+// Interval of reading the search result while searching
+const SCAN_POLL_INTERVAL_MS = 500;
+
 // The opened HID device (null while not connected)
 let device = null;
+
+// Search for BLE keyboards: "idle", "scanning" or "stopping"
+let scanState = "idle";
+// Changed when the search shown on the page is abandoned, so that its loop stops
+let scanSession = 0;
+
+const utf8 = new TextDecoder();
 
 // Rows of the macro table: { tr, numberCell, modifiers, keyName, keyCode, press }
 const macroRows = [];
@@ -86,6 +105,10 @@ function render() {
   connectButton.disabled = connected;
   disconnectButton.disabled = !connected;
   restartButton.disabled = !connected;
+  // BLE keyboards can be searched only while connected
+  keyboardCard.hidden = !connected;
+  scanButton.textContent = scanState === "idle" ? "検索" : "停止";
+  scanButton.disabled = !connected || scanState === "stopping";
   // The macro can be read and changed only while connected
   macroCard.hidden = !connected;
   macroGapInput.disabled = !connected;
@@ -117,6 +140,10 @@ function showResult(area, operation, result) {
 // Send a request and wait for its response (resolves with the response data without the report ID)
 function request(command, args = new Uint8Array(0)) {
   const target = device;
+  // Disconnected meanwhile (e.g. between the requests of the search)
+  if (target === null) {
+    return Promise.reject(new Error("デバイスが接続されていません"));
+  }
   return new Promise((resolve, reject) => {
     let timer;
     const finish = () => {
@@ -144,6 +171,133 @@ function request(command, args = new Uint8Array(0)) {
       reject(error);
     });
   });
+}
+
+// Wait for the time
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Format an address received in little endian as AA:BB:CC:DD:EE:FF
+function formatAddress(bytes) {
+  return [...bytes].reverse().map(hex2).join(":");
+}
+
+// Read the device at the index in the search result (see SPEC.md); found is null if the index is past the end
+async function readScanResult(index) {
+  const response = await request(COMMAND_GET_SCAN_RESULT, Uint8Array.of(index));
+  const result = response.getUint8(1);
+  if (result !== RESULT_SUCCESS) {
+    throw new Error(`検索結果の取得：${resultName(result)}`);
+  }
+  const data = new DataView(response.buffer, response.byteOffset + 2, response.byteLength - 2);
+  const scanning = data.getUint8(0) !== 0;
+  if (index >= data.getUint8(1)) {
+    return { scanning, found: null };
+  }
+  const bytes = (offset, size) => new Uint8Array(data.buffer, data.byteOffset + offset, size);
+  const found = {
+    address: formatAddress(bytes(3, 6)),
+    rssi: data.getInt8(9),
+    name: utf8.decode(bytes(11, data.getUint8(10))),
+  };
+  return { scanning, found };
+}
+
+// Read all the devices in the search result
+async function readScanResults() {
+  const devices = [];
+  for (;;) {
+    const { scanning, found } = await readScanResult(devices.length);
+    if (found === null) {
+      return { scanning, devices };
+    }
+    devices.push(found);
+  }
+}
+
+// Show the devices in the search result on the page
+function showScanResults(devices) {
+  const rows = devices.map((found) => {
+    const name = document.createElement("td");
+    name.textContent = found.name || "（名前なし）";
+    name.classList.toggle("no-name", !found.name);
+    const address = document.createElement("td");
+    address.className = "address";
+    address.textContent = found.address;
+    const rssi = document.createElement("td");
+    rssi.className = "rssi";
+    rssi.textContent = `${found.rssi} dBm`;
+    const tr = document.createElement("tr");
+    tr.append(name, address, rssi);
+    return tr;
+  });
+  scanDevicesBody.replaceChildren(...rows);
+  scanResults.hidden = devices.length === 0;
+}
+
+// Remove the search result from the page (with the message about it) and abandon the search shown on the page
+function clearScan() {
+  scanSession++;
+  scanState = "idle";
+  showScanResults([]);
+  showMessage(keyboardMessage, "");
+  render();
+}
+
+// Start the search and show the result until the search stops
+async function startScan() {
+  const response = await request(COMMAND_START_SCAN);
+  const result = response.getUint8(1);
+  if (result !== RESULT_SUCCESS) {
+    showResult(keyboardMessage, "検索", result);
+    return;
+  }
+  clearScan();
+  const session = scanSession;
+  scanState = "scanning";
+  showMessage(keyboardMessage, "検索しています…");
+  render();
+  try {
+    for (;;) {
+      const { scanning, devices } = await readScanResults();
+      if (session !== scanSession) {
+        return;
+      }
+      showScanResults(devices);
+      if (!scanning) {
+        showMessage(keyboardMessage, devices.length > 0 ? `${devices.length} 台見つかりました` : "見つかりませんでした");
+        break;
+      }
+      await sleep(SCAN_POLL_INTERVAL_MS);
+    }
+  } catch (error) {
+    if (session !== scanSession) {
+      return;
+    }
+    showError(keyboardMessage, error);
+  }
+  scanState = "idle";
+  render();
+}
+
+// Stop the search (the loop of startScan() shows the result when it sees that the search has stopped)
+async function stopScan() {
+  scanState = "stopping";
+  render();
+  try {
+    const response = await request(COMMAND_STOP_SCAN);
+    const result = response.getUint8(1);
+    if (result !== RESULT_SUCCESS) {
+      throw new Error(`停止：${resultName(result)}`);
+    }
+  } catch (error) {
+    if (scanState === "stopping") {
+      scanState = "scanning";
+      render();
+    }
+    throw error;
+  }
 }
 
 // Whether the usage ID can be used as a key in a macro (see SPEC.md)
@@ -382,6 +536,7 @@ async function disconnect() {
   }
   device = null;
   showMessage(deviceMessage, "");
+  clearScan();
   clearMacro();
 }
 
@@ -398,11 +553,16 @@ if ("hid" in navigator) {
   macroAddButton.addEventListener("click", () => {
     addMacroRow({ modifiers: 0, key: null, pressMs: MACRO_DEFAULT_PRESS_MS }).keyName.focus();
   });
+  scanButton.addEventListener("click", () => {
+    const operation = scanState === "idle" ? startScan() : stopScan();
+    operation.catch((error) => showError(keyboardMessage, error));
+  });
   macroSaveButton.addEventListener("click", () => saveMacro().catch((error) => showError(macroMessage, error)));
   // The device was unplugged
   navigator.hid.addEventListener("disconnect", (event) => {
     if (event.device === device) {
       device = null;
+      clearScan();
       clearMacro();
     }
   });

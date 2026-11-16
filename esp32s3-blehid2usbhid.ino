@@ -1,6 +1,7 @@
 // BLE HID to USB HID bridge
 
 #include <Adafruit_TinyUSB.h>
+#include <EspBle.h>
 #include <Preferences.h>
 #include <esp_mac.h>
 #include <nvs_flash.h>
@@ -21,10 +22,14 @@ const uint8_t SETTINGS_REPORT_SIZE = 63;
 const uint8_t COMMAND_RESTART = 0x01;
 const uint8_t COMMAND_GET_MACRO = 0x02;
 const uint8_t COMMAND_SET_MACRO = 0x03;
+const uint8_t COMMAND_START_SCAN = 0x04;
+const uint8_t COMMAND_STOP_SCAN = 0x05;
+const uint8_t COMMAND_GET_SCAN_RESULT = 0x06;
 const uint8_t RESULT_SUCCESS = 0x00;
 const uint8_t RESULT_UNKNOWN_COMMAND = 0x01;
 const uint8_t RESULT_INVALID_ARGUMENT = 0x02;
 const uint8_t RESULT_SAVE_FAILED = 0x03;
+const uint8_t RESULT_BLE_FAILED = 0x04;
 
 // Macro data (see SPEC.md)
 const uint8_t MACRO_MAX_KEYS = 10;
@@ -34,6 +39,15 @@ const size_t MACRO_HEADER_SIZE = 3;
 const size_t MACRO_ENTRY_SIZE = 4;
 const size_t MACRO_MAX_SIZE = MACRO_HEADER_SIZE + MACRO_ENTRY_SIZE * MACRO_MAX_KEYS;
 static_assert(MACRO_MAX_SIZE <= SETTINGS_REPORT_SIZE - 2, "the macro must fit in a response");
+
+// Search for BLE keyboards and the scan result data (see SPEC.md)
+const uint8_t SCAN_MAX_DEVICES = 16;
+const size_t SCAN_NAME_MAX_SIZE = 29;  // Longest name an advertising payload (31 bytes) can carry
+const size_t SCAN_RESULT_HEADER_SIZE = 11;
+static_assert(SCAN_RESULT_HEADER_SIZE + SCAN_NAME_MAX_SIZE <= SETTINGS_REPORT_SIZE - 2, "a scan result must fit in a response");
+const uint16_t APPEARANCE_GENERIC_HID = 0x03C0;
+const uint16_t APPEARANCE_KEYBOARD = 0x03C1;
+const char UUID_HID_SERVICE[] = "1812";
 
 // NVS (the ID marks that the NVS has been initialized by this firmware)
 const char NVS_NAMESPACE[] = "settings";
@@ -52,6 +66,8 @@ uint8_t const descSettings[] = {
 
 Adafruit_USBD_HID keyboard;
 Adafruit_USBD_HID settings;
+
+EspBle ble;
 
 // USB product name with the last 2 bytes of the factory MAC address as the device ID
 static char productName[40];
@@ -77,6 +93,17 @@ static MacroSendState macroSendState = MACRO_SEND_IDLE;
 static uint8_t sendingMacro[MACRO_MAX_SIZE];  // Copy of the macro when the sending started
 static uint8_t sendingIndex;                  // Index of the key being sent
 static uint32_t sendingSinceMs;               // When the current step started
+
+// BLE keyboards found by the search
+struct ScannedDevice {
+  uint8_t addressType;  // As in SPEC.md
+  uint8_t address[6];   // Little endian
+  int8_t rssi;
+  uint8_t nameSize;
+  char name[SCAN_NAME_MAX_SIZE];  // UTF-8, not terminated
+};
+static ScannedDevice scannedDevices[SCAN_MAX_DEVICES];
+static uint8_t scannedCount;
 
 // Output report from the host (Caps Lock etc.)
 void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
@@ -267,6 +294,85 @@ static void updateMacro() {
   }
 }
 
+// Parse an address written as "aa:bb:cc:dd:ee:ff" (most significant byte first) into little endian
+static bool parseAddress(const String &text, uint8_t *address) {
+  return sscanf(text.c_str(), "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &address[5], &address[4], &address[3],
+                &address[2], &address[1], &address[0]) == 6;
+}
+
+// Length of the UTF-8 text cut to at most maxSize bytes without splitting a character
+static size_t truncateUtf8(const char *text, size_t size, size_t maxSize) {
+  if (size <= maxSize) {
+    return size;
+  }
+  size_t cut = maxSize;
+  while (cut > 0 && (text[cut] & 0xC0) == 0x80) {
+    cut--;
+  }
+  return cut;
+}
+
+// Whether the advertisement is from a connectable device that looks like a keyboard (see SPEC.md)
+static bool isKeyboardAdvertisement(const EspBleScanResult &result) {
+  if (!result.connectable) {
+    return false;
+  }
+  if (result.appearance == APPEARANCE_KEYBOARD) {
+    return true;
+  }
+  return result.advertisesService(UUID_HID_SERVICE) &&
+         (result.appearance == 0 || result.appearance == APPEARANCE_GENERIC_HID);
+}
+
+// Add the device to the scan result, or update it if it is already there (see SPEC.md)
+static void onScanResult(const EspBleScanResult &result) {
+  uint8_t address[6];
+  if (!parseAddress(result.address, address)) {
+    return;
+  }
+  uint8_t addressType = static_cast<uint8_t>(result.addressType);
+  ScannedDevice *device = NULL;
+  for (uint8_t i = 0; i < scannedCount; i++) {
+    if (scannedDevices[i].addressType == addressType && memcmp(scannedDevices[i].address, address, 6) == 0) {
+      device = &scannedDevices[i];
+      break;
+    }
+  }
+  if (device == NULL) {
+    if (scannedCount >= SCAN_MAX_DEVICES || !isKeyboardAdvertisement(result)) {
+      return;
+    }
+    device = &scannedDevices[scannedCount++];
+    memset(device, 0, sizeof(*device));
+    device->addressType = addressType;
+    memcpy(device->address, address, 6);
+  }
+  device->rssi = static_cast<int8_t>(result.rssi);
+  if (result.hasName()) {
+    const char *name = result.name.c_str();
+    size_t nameSize = truncateUtf8(name, result.name.length(), SCAN_NAME_MAX_SIZE);
+    // A shortened name is the beginning of the complete name (Bluetooth Core Specification), and EspBle does not
+    // tell them apart: keep the complete name, e.g. from the scan response, when only the advertisement comes
+    bool shortened = nameSize < device->nameSize && memcmp(device->name, name, nameSize) == 0;
+    if (!shortened) {
+      device->nameSize = nameSize;
+      memcpy(device->name, name, nameSize);
+    }
+  }
+}
+
+// Clear the scan result and start the search (restarts it if it is running)
+static bool startScan() {
+  scannedCount = 0;
+  EspBleScanConfig config;
+  // Also receive the scan responses, which often carry the name
+  config.active = true;
+  // Receive every advertisement: the controller drops repeats by address alone, so without this a device
+  // first seen before it advertises as a keyboard (e.g. before entering pairing mode) would never be listed
+  config.wantDuplicates = true;
+  return ble.scanner().start(config);
+}
+
 // Send a response to the settings page
 static void sendSettingsResponse(uint8_t command, uint8_t result, uint8_t const *data, size_t size) {
   uint8_t response[SETTINGS_REPORT_SIZE] = {command, result};
@@ -292,6 +398,24 @@ static uint8_t setMacro(uint8_t const *args) {
   return saveMacro(args, size) ? RESULT_SUCCESS : RESULT_SAVE_FAILED;
 }
 
+// Send the device at the index in the scan result (see SPEC.md)
+static void sendScanResult(uint8_t command, uint8_t index) {
+  uint8_t data[SCAN_RESULT_HEADER_SIZE + SCAN_NAME_MAX_SIZE] = {};
+  data[0] = ble.scanner().isScanning() ? 1 : 0;
+  data[1] = scannedCount;
+  size_t size = 2;
+  if (index < scannedCount) {
+    const ScannedDevice &device = scannedDevices[index];
+    data[2] = device.addressType;
+    memcpy(data + 3, device.address, 6);
+    data[9] = static_cast<uint8_t>(device.rssi);
+    data[10] = device.nameSize;
+    memcpy(data + SCAN_RESULT_HEADER_SIZE, device.name, device.nameSize);
+    size = SCAN_RESULT_HEADER_SIZE + device.nameSize;
+  }
+  sendSettingsResponse(command, RESULT_SUCCESS, data, size);
+}
+
 // Handle a request from the settings page
 static void handleSettingsRequest(uint8_t const *request) {
   uint8_t command = request[0];
@@ -307,6 +431,15 @@ static void handleSettingsRequest(uint8_t const *request) {
       break;
     case COMMAND_SET_MACRO:
       sendSettingsResponse(command, setMacro(request + 1), NULL, 0);
+      break;
+    case COMMAND_START_SCAN:
+      sendSettingsResponse(command, startScan() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
+      break;
+    case COMMAND_STOP_SCAN:
+      sendSettingsResponse(command, ble.scanner().stop() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
+      break;
+    case COMMAND_GET_SCAN_RESULT:
+      sendScanResult(command, request[1]);
       break;
     default:
       sendSettingsResponse(command, RESULT_UNKNOWN_COMMAND, NULL, 0);
@@ -349,6 +482,10 @@ void setup() {
     delay(10);
     TinyUSBDevice.attach();
   }
+
+  // The scan results are delivered from ble.update() in loop()
+  ble.begin();
+  ble.scanner().onResult(onScanResult);
 }
 
 void loop() {
@@ -362,6 +499,8 @@ void loop() {
     startMacro();
   }
   updateMacro();
+
+  ble.update();
 
   delay(LOOP_INTERVAL_MS);
 }

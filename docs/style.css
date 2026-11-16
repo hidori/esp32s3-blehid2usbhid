@@ -345,18 +345,24 @@ input[type="number"] {
   color: var(--muted);
 }
 
-/* Macro table */
+/* Tables (macro and search result) */
 
 .table-wrap {
   overflow-x: auto;
 }
 
-.macro {
+.actions + .table-wrap {
+  margin-top: 1rem;
+}
+
+.macro,
+.devices {
   width: 100%;
   border-collapse: collapse;
 }
 
-.macro th {
+.macro th,
+.devices th {
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
   color: var(--muted);
@@ -366,14 +372,30 @@ input[type="number"] {
   white-space: nowrap;
 }
 
-.macro td {
+.macro td,
+.devices td {
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
 
-.macro tbody tr:last-child td {
+.macro tbody tr:last-child td,
+.devices tbody tr:last-child td {
   border-bottom: none;
+}
+
+.devices .address {
+  font-family: ui-monospace, Consolas, monospace;
+  white-space: nowrap;
+}
+
+.devices .rssi {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.devices .no-name {
+  color: var(--muted);
 }
 
 .macro .number {

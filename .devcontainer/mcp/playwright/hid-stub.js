@@ -13,6 +13,9 @@
   const COMMAND_RESTART = 0x01;
   const COMMAND_GET_MACRO = 0x02;
   const COMMAND_SET_MACRO = 0x03;
+  const COMMAND_START_SCAN = 0x04;
+  const COMMAND_STOP_SCAN = 0x05;
+  const COMMAND_GET_SCAN_RESULT = 0x06;
   const RESULT_SUCCESS = 0x00;
   const RESULT_UNKNOWN_COMMAND = 0x01;
 
@@ -28,6 +31,41 @@
     0x00, 0x3a, 100, 0,
     0x00, 0x3b, 100, 0,
   ]);
+
+  // BLE keyboards found by the search, each after the time from the start of the search.
+  // The addresses are little endian as in the scan result (the first one is shown as C6:55:44:33:22:11)
+  const SCAN_DEVICES = [
+    { afterMs: 300, addressType: 1, address: [0x11, 0x22, 0x33, 0x44, 0x55, 0xc6], rssi: -52, name: "Stub Keyboard" },
+    { afterMs: 1500, addressType: 0, address: [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb], rssi: -71, name: "" },
+    { afterMs: 3000, addressType: 1, address: [0x01, 0x02, 0x03, 0x04, 0x05, 0xd6], rssi: -64, name: "スタブのキーボード" },
+  ];
+
+  // Search: when it started (null before the first search) and when it stopped (null while searching)
+  let scanStartedMs = null;
+  let scanStoppedMs = null;
+
+  // Devices found by the search so far
+  function scannedDevices() {
+    if (scanStartedMs === null) {
+      return [];
+    }
+    const elapsedMs = (scanStoppedMs ?? performance.now()) - scanStartedMs;
+    return SCAN_DEVICES.filter((found) => found.afterMs <= elapsedMs);
+  }
+
+  // Scan result data for the device at the index (see SPEC.md)
+  function scanResult(index) {
+    const devices = scannedDevices();
+    const scanning = scanStartedMs !== null && scanStoppedMs === null;
+    if (index >= devices.length) {
+      return new Uint8Array([scanning ? 1 : 0, devices.length]);
+    }
+    const found = devices[index];
+    const name = new TextEncoder().encode(found.name);
+    return new Uint8Array([
+      scanning ? 1 : 0, devices.length, found.addressType, ...found.address, found.rssi & 0xff, name.length, ...name,
+    ]);
+  }
 
   class StubDevice extends EventTarget {
     productName = "BLE HID to USB HID Bridge (STUB)";
@@ -72,6 +110,20 @@
           this.respond(command, RESULT_SUCCESS);
           break;
         }
+        case COMMAND_START_SCAN:
+          scanStartedMs = performance.now();
+          scanStoppedMs = null;
+          this.respond(command, RESULT_SUCCESS);
+          break;
+        case COMMAND_STOP_SCAN:
+          if (scanStartedMs !== null && scanStoppedMs === null) {
+            scanStoppedMs = performance.now();
+          }
+          this.respond(command, RESULT_SUCCESS);
+          break;
+        case COMMAND_GET_SCAN_RESULT:
+          this.respond(command, RESULT_SUCCESS, scanResult(request[1]));
+          break;
         default:
           this.respond(command, RESULT_UNKNOWN_COMMAND);
           break;
@@ -95,6 +147,9 @@
     // The device goes away (like the restart of the firmware)
     disconnect() {
       this.opened = false;
+      // The search ends with the restart, as the firmware forgets it
+      scanStartedMs = null;
+      scanStoppedMs = null;
       const event = new Event("disconnect");
       event.device = this;
       hid.dispatchEvent(event);

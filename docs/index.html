@@ -31,6 +31,26 @@
       </div>
     </details>
 
+    <details id="keyboard-card" class="card" open hidden>
+      <summary><h2>BLE キーボード</h2></summary>
+      <div class="actions">
+        <button id="scan" class="primary" type="button" disabled>検索</button>
+      </div>
+      <div id="scan-results" class="table-wrap" hidden>
+        <table class="devices">
+          <thead>
+            <tr>
+              <th>名前</th>
+              <th>アドレス</th>
+              <th class="rssi">信号の強さ</th>
+            </tr>
+          </thead>
+          <tbody id="scan-devices"></tbody>
+        </table>
+      </div>
+      <p id="keyboard-message" class="message"></p>
+    </details>
+
     <details id="macro-card" class="card" open hidden>
       <summary><h2>マクロ</h2></summary>
       <div class="field">
