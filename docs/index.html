@@ -43,10 +43,21 @@
               <th>名前</th>
               <th>アドレス</th>
               <th class="rssi">信号の強さ</th>
+              <th></th>
             </tr>
           </thead>
           <tbody id="scan-devices"></tbody>
         </table>
+      </div>
+      <div id="pairing" class="pairing" hidden>
+        <div class="pairing-body">
+          <p id="pairing-status" class="pairing-status"></p>
+          <div id="pairing-passkey-area" hidden>
+            <p id="pairing-passkey" class="passkey"></p>
+            <p class="pairing-hint">BLE キーボードでこの数字を入力し、Enter キーを押してください</p>
+          </div>
+        </div>
+        <button id="pairing-cancel" type="button">中止</button>
       </div>
       <p id="keyboard-message" class="message"></p>
     </details>

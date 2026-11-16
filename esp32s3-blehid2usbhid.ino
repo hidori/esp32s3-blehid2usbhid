@@ -25,6 +25,9 @@ const uint8_t COMMAND_SET_MACRO = 0x03;
 const uint8_t COMMAND_START_SCAN = 0x04;
 const uint8_t COMMAND_STOP_SCAN = 0x05;
 const uint8_t COMMAND_GET_SCAN_RESULT = 0x06;
+const uint8_t COMMAND_START_PAIRING = 0x07;
+const uint8_t COMMAND_CANCEL_PAIRING = 0x08;
+const uint8_t COMMAND_GET_PAIRING_STATE = 0x09;
 const uint8_t RESULT_SUCCESS = 0x00;
 const uint8_t RESULT_UNKNOWN_COMMAND = 0x01;
 const uint8_t RESULT_INVALID_ARGUMENT = 0x02;
@@ -48,6 +51,12 @@ static_assert(SCAN_RESULT_HEADER_SIZE + SCAN_NAME_MAX_SIZE <= SETTINGS_REPORT_SI
 const uint16_t APPEARANCE_GENERIC_HID = 0x03C0;
 const uint16_t APPEARANCE_KEYBOARD = 0x03C1;
 const char UUID_HID_SERVICE[] = "1812";
+
+// Pairing state data (see SPEC.md)
+const size_t PAIRING_STATE_SIZE = 5;
+
+// Most bonds (pairing information) the NimBLE host keeps in the NVS
+const size_t BOND_CAPACITY = CONFIG_BT_NIMBLE_MAX_BONDS;
 
 // NVS (the ID marks that the NVS has been initialized by this firmware)
 const char NVS_NAMESPACE[] = "settings";
@@ -104,6 +113,25 @@ struct ScannedDevice {
 };
 static ScannedDevice scannedDevices[SCAN_MAX_DEVICES];
 static uint8_t scannedCount;
+
+// Pairing with a BLE keyboard (the values are those of SPEC.md)
+enum PairingState : uint8_t {
+  PAIRING_IDLE = 0,            // Not pairing
+  PAIRING_CONNECTING = 1,      // Connecting
+  PAIRING_PAIRING = 2,         // Pairing (also while the registration is replaced after the pairing)
+  PAIRING_PASSKEY = 3,         // Waiting for the passkey to be typed on the keyboard
+  PAIRING_REGISTERED = 4,      // Registered
+  PAIRING_CONNECT_FAILED = 5,  // Failed to connect
+  PAIRING_PAIR_FAILED = 6,     // Failed to pair
+  PAIRING_SAVE_FAILED = 7,     // Failed to save the registration
+};
+static PairingState pairingState = PAIRING_IDLE;
+static uint32_t pairingPasskey;                       // Valid in PAIRING_PASSKEY
+static EspBleConnectionId pairingConnectionId;        // 0 while not connected
+static bool pairingCancelRequested;                   // Canceled; ends when the connection is closed
+static bool pairingBonded;                            // Made a bond; registered when the connection is closed
+static EspBleBond bondsBeforePairing[BOND_CAPACITY];  // Bonds of the other devices when the pairing started
+static size_t bondsBeforePairingCount;
 
 // Output report from the host (Caps Lock etc.)
 void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
@@ -300,6 +328,14 @@ static bool parseAddress(const String &text, uint8_t *address) {
                 &address[2], &address[1], &address[0]) == 6;
 }
 
+// Format a little-endian address as "aa:bb:cc:dd:ee:ff" (most significant byte first), as EspBle does
+static String formatAddress(uint8_t const *address) {
+  char text[18];
+  snprintf(text, sizeof(text), "%02x:%02x:%02x:%02x:%02x:%02x", address[5], address[4], address[3], address[2],
+           address[1], address[0]);
+  return String(text);
+}
+
 // Length of the UTF-8 text cut to at most maxSize bytes without splitting a character
 static size_t truncateUtf8(const char *text, size_t size, size_t maxSize) {
   if (size <= maxSize) {
@@ -324,6 +360,16 @@ static bool isKeyboardAdvertisement(const EspBleScanResult &result) {
          (result.appearance == 0 || result.appearance == APPEARANCE_GENERIC_HID);
 }
 
+// The device with the address in the scan result (NULL if it is not there)
+static ScannedDevice *findScannedDevice(uint8_t addressType, uint8_t const *address) {
+  for (uint8_t i = 0; i < scannedCount; i++) {
+    if (scannedDevices[i].addressType == addressType && memcmp(scannedDevices[i].address, address, 6) == 0) {
+      return &scannedDevices[i];
+    }
+  }
+  return NULL;
+}
+
 // Add the device to the scan result, or update it if it is already there (see SPEC.md)
 static void onScanResult(const EspBleScanResult &result) {
   uint8_t address[6];
@@ -331,13 +377,7 @@ static void onScanResult(const EspBleScanResult &result) {
     return;
   }
   uint8_t addressType = static_cast<uint8_t>(result.addressType);
-  ScannedDevice *device = NULL;
-  for (uint8_t i = 0; i < scannedCount; i++) {
-    if (scannedDevices[i].addressType == addressType && memcmp(scannedDevices[i].address, address, 6) == 0) {
-      device = &scannedDevices[i];
-      break;
-    }
-  }
+  ScannedDevice *device = findScannedDevice(addressType, address);
   if (device == NULL) {
     if (scannedCount >= SCAN_MAX_DEVICES || !isKeyboardAdvertisement(result)) {
       return;
@@ -371,6 +411,167 @@ static bool startScan() {
   // first seen before it advertises as a keyboard (e.g. before entering pairing mode) would never be listed
   config.wantDuplicates = true;
   return ble.scanner().start(config);
+}
+
+// Whether the pairing is in progress (see SPEC.md)
+static bool isPairing() {
+  return pairingState == PAIRING_CONNECTING || pairingState == PAIRING_PAIRING || pairingState == PAIRING_PASSKEY;
+}
+
+// Whether the two bonds are of the same device
+static bool isSameBond(const EspBleBond &a, const EspBleBond &b) {
+  return a.peerAddressType == b.peerAddressType && a.peerAddress.equalsIgnoreCase(b.peerAddress);
+}
+
+// Read all the bonds (false if they cannot be read)
+static bool readBonds(EspBleBond *bonds, size_t &count) {
+  count = min(ble.bondCount(), BOND_CAPACITY);
+  for (size_t i = 0; i < count; i++) {
+    if (!ble.bond(i, bonds[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Whether the bond was there when the pairing started
+static bool isBondBeforePairing(const EspBleBond &bond) {
+  for (size_t i = 0; i < bondsBeforePairingCount; i++) {
+    if (isSameBond(bondsBeforePairing[i], bond)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Leave only the bond made by the pairing, so that it replaces the registration (needs no connection to delete a bond)
+static bool replaceRegistration() {
+  EspBleBond bonds[BOND_CAPACITY];
+  size_t count;
+  if (!readBonds(bonds, count)) {
+    return false;
+  }
+  bool made = false;
+  for (size_t i = 0; i < count; i++) {
+    made = made || !isBondBeforePairing(bonds[i]);
+  }
+  if (!made) {
+    // The pairing has updated a bond with an address seen before: it can be told apart only if it is the only one
+    return count == 1;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (isBondBeforePairing(bonds[i]) && !ble.deleteBond(bonds[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Start pairing with the device in the scan result (see SPEC.md)
+static uint8_t startPairing(uint8_t const *args) {
+  if (isPairing()) {
+    return RESULT_BLE_FAILED;
+  }
+  const ScannedDevice *device = findScannedDevice(args[0], args + 1);
+  if (device == NULL) {
+    return RESULT_INVALID_ARGUMENT;
+  }
+  EspBleBond target;
+  target.peerAddress = formatAddress(device->address);
+  target.peerAddressType = static_cast<EspBleAddressType>(device->addressType);
+
+  // Delete the bond of the device itself, or the stack would only encrypt with the old keys instead of pairing.
+  // Keep the others until the pairing succeeds (see SPEC.md)
+  EspBleBond bonds[BOND_CAPACITY];
+  size_t count;
+  if (!readBonds(bonds, count)) {
+    return RESULT_BLE_FAILED;
+  }
+  bondsBeforePairingCount = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (!isSameBond(bonds[i], target)) {
+      bondsBeforePairing[bondsBeforePairingCount++] = bonds[i];
+    } else if (!ble.deleteBond(bonds[i])) {
+      return RESULT_BLE_FAILED;
+    }
+  }
+
+  pairingPasskey = 0;
+  pairingConnectionId = 0;
+  pairingCancelRequested = false;
+  pairingBonded = false;
+  // connect() stops the search first, and the pairing starts as soon as connected (pairOnConnect)
+  if (!ble.connect(target.peerAddress.c_str(), target.peerAddressType)) {
+    return RESULT_BLE_FAILED;
+  }
+  pairingState = PAIRING_CONNECTING;
+  return RESULT_SUCCESS;
+}
+
+// Cancel the pairing, which ends when the connection is closed (see SPEC.md)
+static void cancelPairing() {
+  if (!isPairing()) {
+    return;
+  }
+  pairingCancelRequested = true;
+  // A connection attempt cannot be canceled: onPairingConnected() closes the connection if it is made
+  if (pairingConnectionId != 0) {
+    ble.disconnect(pairingConnectionId);
+  }
+}
+
+// Connected to the device to pair with
+static void onPairingConnected(const EspBleConnection &connection) {
+  if (pairingState != PAIRING_CONNECTING) {
+    return;
+  }
+  pairingConnectionId = connection.id;
+  if (pairingCancelRequested) {
+    ble.disconnect(connection.id);
+    return;
+  }
+  pairingState = PAIRING_PAIRING;
+}
+
+// Failed to connect to the device to pair with
+static void onPairingConnectionFailed(const EspBleConnectionFailure &failure) {
+  if (pairingState != PAIRING_CONNECTING) {
+    return;
+  }
+  pairingState = pairingCancelRequested ? PAIRING_IDLE : PAIRING_CONNECT_FAILED;
+}
+
+// The passkey to be typed on the keyboard (Passkey Entry)
+static void onPairingPasskey(const EspBlePasskeyDisplayed &event) {
+  if (event.connection.id != pairingConnectionId || pairingCancelRequested) {
+    return;
+  }
+  pairingPasskey = event.passkey;
+  pairingState = PAIRING_PASSKEY;
+}
+
+// The pairing has ended; the registration is replaced after the disconnection, since a bond can be deleted only
+// without a connection
+static void onPairingSecurityChanged(const EspBleSecurityChanged &event) {
+  if (event.connection.id != pairingConnectionId) {
+    return;
+  }
+  pairingBonded = event.success && event.connection.bonded;
+  pairingState = PAIRING_PAIRING;
+  ble.disconnect(pairingConnectionId);
+}
+
+// The connection to the device to pair with is closed: the end of the pairing
+static void onPairingDisconnected(const EspBleConnection &connection) {
+  if (pairingConnectionId == 0 || connection.id != pairingConnectionId) {
+    return;
+  }
+  pairingConnectionId = 0;
+  if (pairingBonded) {
+    pairingState = replaceRegistration() ? PAIRING_REGISTERED : PAIRING_SAVE_FAILED;
+  } else {
+    pairingState = pairingCancelRequested ? PAIRING_IDLE : PAIRING_PAIR_FAILED;
+  }
 }
 
 // Send a response to the settings page
@@ -416,6 +617,16 @@ static void sendScanResult(uint8_t command, uint8_t index) {
   sendSettingsResponse(command, RESULT_SUCCESS, data, size);
 }
 
+// Send the pairing state (see SPEC.md)
+static void sendPairingState(uint8_t command) {
+  uint8_t data[PAIRING_STATE_SIZE] = {pairingState};
+  uint32_t passkey = pairingState == PAIRING_PASSKEY ? pairingPasskey : 0;
+  for (size_t i = 0; i < 4; i++) {
+    data[1 + i] = (passkey >> (8 * i)) & 0xFF;
+  }
+  sendSettingsResponse(command, RESULT_SUCCESS, data, sizeof(data));
+}
+
 // Handle a request from the settings page
 static void handleSettingsRequest(uint8_t const *request) {
   uint8_t command = request[0];
@@ -433,13 +644,24 @@ static void handleSettingsRequest(uint8_t const *request) {
       sendSettingsResponse(command, setMacro(request + 1), NULL, 0);
       break;
     case COMMAND_START_SCAN:
-      sendSettingsResponse(command, startScan() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
+      // Not while pairing (see SPEC.md)
+      sendSettingsResponse(command, !isPairing() && startScan() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
       break;
     case COMMAND_STOP_SCAN:
       sendSettingsResponse(command, ble.scanner().stop() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
       break;
     case COMMAND_GET_SCAN_RESULT:
       sendScanResult(command, request[1]);
+      break;
+    case COMMAND_START_PAIRING:
+      sendSettingsResponse(command, startPairing(request + 1), NULL, 0);
+      break;
+    case COMMAND_CANCEL_PAIRING:
+      cancelPairing();
+      sendSettingsResponse(command, RESULT_SUCCESS, NULL, 0);
+      break;
+    case COMMAND_GET_PAIRING_STATE:
+      sendPairingState(command);
       break;
     default:
       sendSettingsResponse(command, RESULT_UNKNOWN_COMMAND, NULL, 0);
@@ -483,9 +705,21 @@ void setup() {
     TinyUSBDevice.attach();
   }
 
-  // The scan results are delivered from ble.update() in loop()
-  ble.begin();
+  // Pair as the side that only displays the passkey, requesting MITM protection: a keyboard that can type gets
+  // Passkey Entry (the passkey is shown on the settings page), and the others get Just Works
+  EspBleConfig config;
+  config.security.enabled = true;
+  config.security.bonding = true;
+  config.security.mitm = true;
+  config.security.ioCapability = EspBleSecurityIoCapability::DisplayOnly;
+  // The scan results and the events of the connections are delivered from ble.update() in loop()
+  ble.begin(config);
   ble.scanner().onResult(onScanResult);
+  ble.onConnected(onPairingConnected);
+  ble.onConnectionFailed(onPairingConnectionFailed);
+  ble.onPasskeyDisplayed(onPairingPasskey);
+  ble.onSecurityChanged(onPairingSecurityChanged);
+  ble.onDisconnected(onPairingDisconnected);
 }
 
 void loop() {

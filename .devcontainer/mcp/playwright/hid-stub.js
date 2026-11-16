@@ -16,8 +16,20 @@
   const COMMAND_START_SCAN = 0x04;
   const COMMAND_STOP_SCAN = 0x05;
   const COMMAND_GET_SCAN_RESULT = 0x06;
+  const COMMAND_START_PAIRING = 0x07;
+  const COMMAND_CANCEL_PAIRING = 0x08;
+  const COMMAND_GET_PAIRING_STATE = 0x09;
   const RESULT_SUCCESS = 0x00;
   const RESULT_UNKNOWN_COMMAND = 0x01;
+  const RESULT_INVALID_ARGUMENT = 0x02;
+  const RESULT_BLE_FAILED = 0x04;
+  const PAIRING_IDLE = 0;
+  const PAIRING_CONNECTING = 1;
+  const PAIRING_PAIRING = 2;
+  const PAIRING_PASSKEY = 3;
+  const PAIRING_REGISTERED = 4;
+  const PAIRING_CONNECT_FAILED = 5;
+  const PAIRING_PAIR_FAILED = 6;
 
   // Time until a response arrives, and until the device is disconnected by a restart
   const RESPONSE_DELAY_MS = 10;
@@ -32,17 +44,77 @@
     0x00, 0x3b, 100, 0,
   ]);
 
-  // BLE keyboards found by the search, each after the time from the start of the search.
-  // The addresses are little endian as in the scan result (the first one is shown as C6:55:44:33:22:11)
+  // BLE keyboards found by the search, each after the time from the start of the search, and how the pairing with
+  // each goes (see PAIRING_TIMELINES). The addresses are little endian as in the scan result (the first one is shown
+  // as C6:55:44:33:22:11)
   const SCAN_DEVICES = [
-    { afterMs: 300, addressType: 1, address: [0x11, 0x22, 0x33, 0x44, 0x55, 0xc6], rssi: -52, name: "Stub Keyboard" },
-    { afterMs: 1500, addressType: 0, address: [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb], rssi: -71, name: "" },
-    { afterMs: 3000, addressType: 1, address: [0x01, 0x02, 0x03, 0x04, 0x05, 0xd6], rssi: -64, name: "スタブのキーボード" },
+    {
+      afterMs: 300,
+      addressType: 1,
+      address: [0x11, 0x22, 0x33, 0x44, 0x55, 0xc6],
+      rssi: -52,
+      name: "Stub Keyboard",
+      pairing: "passkey",
+    },
+    {
+      afterMs: 1500,
+      addressType: 0,
+      address: [0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb],
+      rssi: -71,
+      name: "",
+      pairing: "justWorks",
+    },
+    {
+      afterMs: 3000,
+      addressType: 1,
+      address: [0x01, 0x02, 0x03, 0x04, 0x05, 0xd6],
+      rssi: -64,
+      name: "スタブのキーボード",
+      pairing: "wrongPasskey",
+    },
+    {
+      afterMs: 4500,
+      addressType: 1,
+      address: [0x21, 0x43, 0x65, 0x87, 0xa9, 0xcb],
+      rssi: -90,
+      name: "Stub Faraway",
+      pairing: "unreachable",
+    },
   ];
+
+  // How each pairing goes: the states until the times from the start of the pairing, then the end state.
+  // The first state is always connecting (shorter than the 10 s connection timeout of the firmware)
+  const PAIRING_TIMELINES = {
+    passkey: {
+      steps: [[1000, PAIRING_CONNECTING], [1500, PAIRING_PAIRING], [6500, PAIRING_PASSKEY]],
+      end: PAIRING_REGISTERED,
+    },
+    justWorks: {
+      steps: [[1000, PAIRING_CONNECTING], [2500, PAIRING_PAIRING]],
+      end: PAIRING_REGISTERED,
+    },
+    wrongPasskey: {
+      steps: [[1000, PAIRING_CONNECTING], [1500, PAIRING_PAIRING], [4500, PAIRING_PASSKEY]],
+      end: PAIRING_PAIR_FAILED,
+    },
+    unreachable: {
+      steps: [[3000, PAIRING_CONNECTING]],
+      end: PAIRING_CONNECT_FAILED,
+    },
+  };
+
+  // Passkey shown while waiting for it to be typed (with leading zeros, to check that they are shown)
+  const PASSKEY = 4321;
+
+  // Time until the connection is closed after a cancel
+  const DISCONNECT_MS = 100;
 
   // Search: when it started (null before the first search) and when it stopped (null while searching)
   let scanStartedMs = null;
   let scanStoppedMs = null;
+
+  // Pairing: { timeline, startedMs, endedMs } (null before the first pairing). endedMs is when a canceled pairing ends
+  let pairing = null;
 
   // Devices found by the search so far
   function scannedDevices() {
@@ -65,6 +137,66 @@
     return new Uint8Array([
       scanning ? 1 : 0, devices.length, found.addressType, ...found.address, found.rssi & 0xff, name.length, ...name,
     ]);
+  }
+
+  // Pairing state like the firmware (see SPEC.md)
+  function pairingState() {
+    if (pairing === null) {
+      return PAIRING_IDLE;
+    }
+    const now = performance.now();
+    if (pairing.endedMs !== null && now >= pairing.endedMs) {
+      return PAIRING_IDLE;
+    }
+    const elapsedMs = now - pairing.startedMs;
+    const step = pairing.timeline.steps.find(([untilMs]) => elapsedMs < untilMs);
+    return step ? step[1] : pairing.timeline.end;
+  }
+
+  // Whether the pairing is in progress
+  function isPairing() {
+    const state = pairingState();
+    return state === PAIRING_CONNECTING || state === PAIRING_PAIRING || state === PAIRING_PASSKEY;
+  }
+
+  // Pairing state data (see SPEC.md)
+  function pairingStateData() {
+    const state = pairingState();
+    const data = new DataView(new ArrayBuffer(5));
+    data.setUint8(0, state);
+    data.setUint32(1, state === PAIRING_PASSKEY ? PASSKEY : 0, true);
+    return new Uint8Array(data.buffer);
+  }
+
+  // Start pairing with the device in the scan result
+  function startPairing(args) {
+    if (isPairing()) {
+      return RESULT_BLE_FAILED;
+    }
+    const found = scannedDevices().find(
+      (candidate) => candidate.addressType === args[0] && candidate.address.every((byte, i) => byte === args[1 + i]),
+    );
+    if (!found) {
+      return RESULT_INVALID_ARGUMENT;
+    }
+    // Like EspBle, the search is stopped before connecting
+    if (scanStartedMs !== null && scanStoppedMs === null) {
+      scanStoppedMs = performance.now();
+    }
+    pairing = { timeline: PAIRING_TIMELINES[found.pairing], startedMs: performance.now(), endedMs: null };
+    return RESULT_SUCCESS;
+  }
+
+  // Cancel the pairing: a connection attempt is not canceled but runs out, and a connection is closed
+  function cancelPairing() {
+    if (!isPairing() || pairing.endedMs !== null) {
+      return;
+    }
+    if (pairingState() === PAIRING_CONNECTING) {
+      pairing.endedMs = pairing.startedMs + pairing.timeline.steps[0][0];
+    } else {
+      pairing.endedMs = performance.now() + DISCONNECT_MS;
+    }
   }
 
   class StubDevice extends EventTarget {
@@ -111,6 +243,11 @@
           break;
         }
         case COMMAND_START_SCAN:
+          // Not while pairing, like the firmware
+          if (isPairing()) {
+            this.respond(command, RESULT_BLE_FAILED);
+            break;
+          }
           scanStartedMs = performance.now();
           scanStoppedMs = null;
           this.respond(command, RESULT_SUCCESS);
@@ -123,6 +260,16 @@
           break;
         case COMMAND_GET_SCAN_RESULT:
           this.respond(command, RESULT_SUCCESS, scanResult(request[1]));
+          break;
+        case COMMAND_START_PAIRING:
+          this.respond(command, startPairing(request.subarray(1)));
+          break;
+        case COMMAND_CANCEL_PAIRING:
+          cancelPairing();
+          this.respond(command, RESULT_SUCCESS);
+          break;
+        case COMMAND_GET_PAIRING_STATE:
+          this.respond(command, RESULT_SUCCESS, pairingStateData());
           break;
         default:
           this.respond(command, RESULT_UNKNOWN_COMMAND);
@@ -147,9 +294,10 @@
     // The device goes away (like the restart of the firmware)
     disconnect() {
       this.opened = false;
-      // The search ends with the restart, as the firmware forgets it
+      // The search and the pairing end with the restart, as the firmware forgets them
       scanStartedMs = null;
       scanStoppedMs = null;
+      pairing = null;
       const event = new Event("disconnect");
       event.device = this;
       hid.dispatchEvent(event);
