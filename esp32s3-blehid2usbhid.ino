@@ -59,6 +59,12 @@ const size_t BOND_CAPACITY = CONFIG_BT_NIMBLE_MAX_BONDS;
 // the connection; it only bounds how long the start of a search waits for an attempt to end
 const uint32_t KEYBOARD_CONNECT_ATTEMPT_MS = 1000;
 
+// Connection interval requested while the HID service of the registered keyboard is prepared, in units of 1.25 ms
+// (7.5-15 ms). Each GATT operation takes round trips over the connection, so a short interval shortens the
+// preparation. The parameters of the connection are put back when the relay starts
+const uint16_t PREPARATION_INTERVAL_MIN = 6;
+const uint16_t PREPARATION_INTERVAL_MAX = 12;
+
 // Usages of the HID Keyboard/Keypad page: the errors (ErrorRollOver, POSTFail, ErrorUndefined), the keys, and the
 // modifiers 0xE0-0xE7, which go in the modifier byte
 const uint16_t USAGE_PAGE_KEYBOARD = 0x07;
@@ -158,6 +164,10 @@ static bool scanRequested;
 static bool keyboardConnecting;                  // An attempt to connect is in progress
 static EspBleConnectionId keyboardConnectionId;  // 0 while not connected
 static bool keyboardReady;  // Subscribed to the keyboard input after the encryption with the bond: relaying
+// Parameters of the connection when it was made (units of EspBleConnection), put back when the relay starts
+static uint16_t keyboardInterval;
+static uint16_t keyboardLatency;
+static uint16_t keyboardSupervisionTimeout;
 
 // State of the connection to the registered keyboard (the values are those of SPEC.md)
 enum KeyboardState : uint8_t {
@@ -1068,12 +1078,17 @@ static void subscribeNextKeyboardReport() {
   hidStep = HID_STEP_NONE;
   keyboardReady = true;
   DEBUG_LOG("[debug] relaying\n");
+  // Put back the parameters of the connection, so that the relay runs as before the preparation was shortened
+  bool requested = ble.updateConnectionParameters(keyboardConnectionId, keyboardInterval, keyboardInterval,
+                                                  keyboardLatency, keyboardSupervisionTimeout);
+  DEBUG_LOG("[debug] put back the connection parameters: %d, %s\n", requested, ble.lastErrorDetail().c_str());
 }
 
-// Read the Report Reference of the next Report that has one; when all are read, subscribe to the keyboard input
-// reports
+// Read the Report Reference of the next notifiable Report that has one (the others cannot be keyboard input reports);
+// when all are read, subscribe to the keyboard input reports
 static void readNextReportReference() {
-  while (hidStepIndex < hidReportCount && hidReports[hidStepIndex].referenceHandle == 0) {
+  while (hidStepIndex < hidReportCount &&
+         (hidReports[hidStepIndex].referenceHandle == 0 || !hidReports[hidStepIndex].notifiable)) {
     hidStepIndex++;
   }
   if (hidStepIndex < hidReportCount) {
@@ -1122,16 +1137,40 @@ static void debugLogKeyboardFormats(const EspBleGattResult &result) {
   }
 }
 
-// Connected to the registered keyboard; the encryption with the bond starts by itself (pairOnConnect). If the
-// pairing has started during the attempt, close the connection so that the pairing can go on
+// Connected to the registered keyboard; the encryption with the bond starts by itself (pairOnConnect). Ask for a short
+// connection interval for the preparation of the HID service. If the pairing has started during the attempt, close the
+// connection so that the pairing can go on
 static void onKeyboardConnected(const EspBleConnection &connection) {
-  DEBUG_LOG("[debug] keyboard connected: connection %u, %s (type %u)\n", static_cast<unsigned>(connection.id),
-            connection.peerAddress.c_str(), static_cast<unsigned>(connection.peerAddressType));
+  DEBUG_LOG("[debug] keyboard connected: connection %u, %s (type %u), interval %u, latency %u, timeout %u, mtu %u\n",
+            static_cast<unsigned>(connection.id), connection.peerAddress.c_str(),
+            static_cast<unsigned>(connection.peerAddressType), connection.connectionInterval,
+            connection.peripheralLatency, connection.supervisionTimeout, connection.mtu);
   keyboardConnectionId = connection.id;
   keyboardReady = false;
   hidStep = HID_STEP_NONE;
   if (isPairing()) {
     ble.disconnect(connection.id);
+    return;
+  }
+  keyboardInterval = connection.connectionInterval;
+  keyboardLatency = connection.peripheralLatency;
+  keyboardSupervisionTimeout = connection.supervisionTimeout;
+  bool requested = ble.updateConnectionParameters(connection.id, PREPARATION_INTERVAL_MIN, PREPARATION_INTERVAL_MAX, 0,
+                                                  connection.supervisionTimeout);
+  DEBUG_LOG("[debug] ask for a short connection interval: %d, %s\n", requested, ble.lastErrorDetail().c_str());
+}
+
+// [debug] Print the connection parameters and the MTU of the connection to the registered keyboard
+static void onConnectionParametersUpdated(const EspBleConnection &connection) {
+  if (keyboardConnectionId != 0 && connection.id == keyboardConnectionId) {
+    DEBUG_LOG("[debug] connection parameters: interval %u, latency %u, timeout %u\n", connection.connectionInterval,
+              connection.peripheralLatency, connection.supervisionTimeout);
+  }
+}
+
+static void onMtuChanged(const EspBleMtuChanged &event) {
+  if (keyboardConnectionId != 0 && event.connection.id == keyboardConnectionId) {
+    DEBUG_LOG("[debug] mtu: %u -> %u\n", event.previousMtu, event.connection.mtu);
   }
 }
 
@@ -1464,6 +1503,8 @@ void setup() {
   ble.onDescriptorRead(onDescriptorRead);
   ble.onSubscribed(onSubscribed);
   ble.onNotification(onNotification);
+  ble.onConnectionParametersUpdated(onConnectionParametersUpdated);
+  ble.onMtuChanged(onMtuChanged);
 }
 
 void loop() {
