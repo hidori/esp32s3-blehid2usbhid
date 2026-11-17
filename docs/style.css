@@ -266,6 +266,31 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
+/* Registered keyboard and the state of the connection to it */
+
+.registration {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+}
+
+.registration-label {
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.registration .address {
+  color: var(--muted);
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+.registration .no-name {
+  color: var(--muted);
+}
+
 /* Search result table */
 
 .table-wrap {

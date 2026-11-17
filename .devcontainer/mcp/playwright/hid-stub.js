@@ -17,6 +17,7 @@
   const COMMAND_START_PAIRING = 0x07;
   const COMMAND_CANCEL_PAIRING = 0x08;
   const COMMAND_GET_PAIRING_STATE = 0x09;
+  const COMMAND_GET_REGISTRATION = 0x0a;
   const RESULT_SUCCESS = 0x00;
   const RESULT_UNKNOWN_COMMAND = 0x01;
   const RESULT_INVALID_ARGUMENT = 0x02;
@@ -28,6 +29,9 @@
   const PAIRING_REGISTERED = 4;
   const PAIRING_CONNECT_FAILED = 5;
   const PAIRING_PAIR_FAILED = 6;
+  const KEYBOARD_IDLE = 0;
+  const KEYBOARD_CONNECTING = 1;
+  const KEYBOARD_RELAYING = 3;
 
   // Time until a response arrives, and until the device is disconnected by a restart
   const RESPONSE_DELAY_MS = 10;
@@ -98,12 +102,20 @@
   // Time until the connection is closed after a cancel
   const DISCONNECT_MS = 100;
 
+  // Time until the registered keyboard is connected to (after the pairing, or after a restart)
+  const RECONNECT_MS = 1500;
+
   // Search: when it started (null before the first search) and when it stopped (null while searching)
   let scanStartedMs = null;
   let scanStoppedMs = null;
 
-  // Pairing: { timeline, startedMs, endedMs } (null before the first pairing). endedMs is when a canceled pairing ends
+  // Pairing: { found, timeline, startedMs, endedMs, registeredChecked } (null before the first pairing). endedMs is
+  // when a canceled pairing ends
   let pairing = null;
+
+  // Registered keyboard: { found, sinceMs } (null if none). It survives a restart like the bonds in the NVS, and the
+  // keyboard is connected to RECONNECT_MS after sinceMs
+  let registered = null;
 
   // Devices found by the search so far
   function scannedDevices() {
@@ -172,7 +184,13 @@
     if (scanStartedMs !== null && scanStoppedMs === null) {
       scanStoppedMs = performance.now();
     }
-    pairing = { timeline: PAIRING_TIMELINES[found.pairing], startedMs: performance.now(), endedMs: null };
+    pairing = {
+      found,
+      timeline: PAIRING_TIMELINES[found.pairing],
+      startedMs: performance.now(),
+      endedMs: null,
+      registeredChecked: false,
+    };
     return RESULT_SUCCESS;
   }
 
@@ -186,6 +204,32 @@
     } else {
       pairing.endedMs = performance.now() + DISCONNECT_MS;
     }
+  }
+
+  // Register the device of the pairing once the pairing has succeeded
+  function updateRegistered() {
+    if (pairing === null || pairing.registeredChecked || pairingState() !== PAIRING_REGISTERED) {
+      return;
+    }
+    const steps = pairing.timeline.steps;
+    registered = { found: pairing.found, sinceMs: pairing.startedMs + steps[steps.length - 1][0] };
+    pairing.registeredChecked = true;
+  }
+
+  // Registration data like the firmware (see SPEC.md)
+  function registrationData() {
+    updateRegistered();
+    if (registered === null) {
+      return new Uint8Array([0]);
+    }
+    let state;
+    if (isPairing() || (scanStartedMs !== null && scanStoppedMs === null)) {
+      state = KEYBOARD_IDLE; // Not connected to while searching or pairing
+    } else {
+      state = performance.now() - registered.sinceMs < RECONNECT_MS ? KEYBOARD_CONNECTING : KEYBOARD_RELAYING;
+    }
+    const name = new TextEncoder().encode(registered.found.name);
+    return new Uint8Array([1, registered.found.addressType, ...registered.found.address, state, name.length, ...name]);
   }
 
   class StubDevice extends EventTarget {
@@ -251,6 +295,9 @@
         case COMMAND_GET_PAIRING_STATE:
           this.respond(command, RESULT_SUCCESS, pairingStateData());
           break;
+        case COMMAND_GET_REGISTRATION:
+          this.respond(command, RESULT_SUCCESS, registrationData());
+          break;
         default:
           this.respond(command, RESULT_UNKNOWN_COMMAND);
           break;
@@ -275,9 +322,13 @@
     disconnect() {
       this.opened = false;
       // The search and the pairing end with the restart, as the firmware forgets them
+      updateRegistered();
       scanStartedMs = null;
       scanStoppedMs = null;
       pairing = null;
+      if (registered !== null) {
+        registered.sinceMs = performance.now();
+      }
       const event = new Event("disconnect");
       event.device = this;
       hid.dispatchEvent(event);

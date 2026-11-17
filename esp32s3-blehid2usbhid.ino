@@ -9,6 +9,9 @@
 // Interval of loop()
 const uint32_t LOOP_INTERVAL_MS = 1;
 
+// Temporary log on the USB serial to find why the input is not relayed (to be removed before committing)
+#define DEBUG_LOG(...) Serial.printf(__VA_ARGS__)
+
 // Settings HID protocol (see SPEC.md)
 const uint8_t SETTINGS_REPORT_ID = 2;
 const uint8_t SETTINGS_REPORT_SIZE = 63;
@@ -19,6 +22,7 @@ const uint8_t COMMAND_GET_SCAN_RESULT = 0x06;
 const uint8_t COMMAND_START_PAIRING = 0x07;
 const uint8_t COMMAND_CANCEL_PAIRING = 0x08;
 const uint8_t COMMAND_GET_PAIRING_STATE = 0x09;
+const uint8_t COMMAND_GET_REGISTRATION = 0x0A;
 const uint8_t RESULT_SUCCESS = 0x00;
 const uint8_t RESULT_UNKNOWN_COMMAND = 0x01;
 const uint8_t RESULT_INVALID_ARGUMENT = 0x02;
@@ -31,17 +35,52 @@ const size_t SCAN_RESULT_HEADER_SIZE = 11;
 static_assert(SCAN_RESULT_HEADER_SIZE + SCAN_NAME_MAX_SIZE <= SETTINGS_REPORT_SIZE - 2, "a scan result must fit in a response");
 const uint16_t APPEARANCE_GENERIC_HID = 0x03C0;
 const uint16_t APPEARANCE_KEYBOARD = 0x03C1;
+
+// HID over GATT: the HID service, its Report Map and Reports, the Report Reference of a Report, and the type of an
+// input report in the Report Reference
 const char UUID_HID_SERVICE[] = "1812";
+const char UUID_REPORT_MAP[] = "2a4b";
+const char UUID_REPORT[] = "2a4d";
+const char UUID_REPORT_REFERENCE[] = "2908";
+const uint8_t REPORT_TYPE_INPUT = 1;
+const size_t HID_MAX_REPORTS = 16;  // Reports of the HID service that are looked at
 
 // Pairing state data (see SPEC.md)
 const size_t PAIRING_STATE_SIZE = 5;
 
+// Registration data (see SPEC.md)
+const size_t REGISTRATION_HEADER_SIZE = 10;
+static_assert(REGISTRATION_HEADER_SIZE + SCAN_NAME_MAX_SIZE <= SETTINGS_REPORT_SIZE - 2, "the registration must fit in a response");
+
 // Most bonds (pairing information) the NimBLE host keeps in the NVS
 const size_t BOND_CAPACITY = CONFIG_BT_NIMBLE_MAX_BONDS;
+
+// Length of an attempt to connect to the registered keyboard. The attempts follow one another, so this does not delay
+// the connection; it only bounds how long the start of a search waits for an attempt to end
+const uint32_t KEYBOARD_CONNECT_ATTEMPT_MS = 1000;
+
+// Usages of the HID Keyboard/Keypad page: the errors (ErrorRollOver, POSTFail, ErrorUndefined), the keys, and the
+// modifiers 0xE0-0xE7, which go in the modifier byte
+const uint16_t USAGE_PAGE_KEYBOARD = 0x07;
+const uint8_t USAGE_ERROR_ROLL_OVER = 0x01;
+const uint8_t USAGE_ERROR_UNDEFINED = 0x03;
+const uint8_t USAGE_FIRST_KEY = 0x04;
+const uint8_t USAGE_LAST_KEY = 0xDF;
+const uint8_t USAGE_FIRST_MODIFIER = 0xE0;
+
+// Keys in a boot keyboard report, and the reports waiting to be sent to the host
+const size_t KEYBOARD_REPORT_KEYS = 6;
+const size_t KEYBOARD_REPORT_QUEUE_SIZE = 16;
+
+// Layout of the keyboard input reports of the BLE keyboard, read from its Report Map
+const size_t KEY_FIELD_MAX_USAGES = 8;  // Usages listed one by one for a field
+const size_t KEYBOARD_MAX_FIELDS = 4;   // Fields with keys in a report
+const size_t KEYBOARD_MAX_FORMATS = 4;  // Keyboard input reports (report IDs)
 
 // NVS (the ID marks that the NVS has been initialized by this firmware)
 const char NVS_NAMESPACE[] = "settings";
 const char NVS_KEY_ID[] = "id";
+const char NVS_KEY_KEYBOARD[] = "keyboard";  // Address and name of the registered keyboard
 const uint32_t NVS_ID = 0xB1E2B5B0;
 
 // Keyboard (boot protocol, no report ID so that boot and report protocol share the format)
@@ -80,22 +119,111 @@ static uint8_t scannedCount;
 
 // Pairing with a BLE keyboard (the values are those of SPEC.md)
 enum PairingState : uint8_t {
-  PAIRING_IDLE = 0,            // Not pairing
-  PAIRING_CONNECTING = 1,      // Connecting
-  PAIRING_PAIRING = 2,         // Pairing (also while the registration is replaced after the pairing)
-  PAIRING_PASSKEY = 3,         // Waiting for the passkey to be typed on the keyboard
-  PAIRING_REGISTERED = 4,      // Registered
-  PAIRING_CONNECT_FAILED = 5,  // Failed to connect
-  PAIRING_PAIR_FAILED = 6,     // Failed to pair
-  PAIRING_SAVE_FAILED = 7,     // Failed to save the registration
+  PAIRING_IDLE = 0,                 // Not pairing
+  PAIRING_CONNECTING = 1,           // Connecting (also while preparing to connect)
+  PAIRING_PAIRING = 2,              // Pairing (also while the registration is replaced after the pairing)
+  PAIRING_PASSKEY = 3,              // Waiting for the passkey to be typed on the keyboard
+  PAIRING_REGISTERED = 4,           // Registered
+  PAIRING_CONNECT_FAILED = 5,       // Failed to connect
+  PAIRING_PAIR_FAILED = 6,          // Failed to pair
+  PAIRING_REGISTRATION_FAILED = 7,  // Failed to rewrite the registration
 };
 static PairingState pairingState = PAIRING_IDLE;
+static bool pairingPreparing;                         // Waiting for the relay to stop before connecting
+static EspBleBond pairingTarget;                      // The device to pair with
+static uint8_t pairingTargetNameSize;                 // Name of the device in the scan result
+static char pairingTargetName[SCAN_NAME_MAX_SIZE];
 static uint32_t pairingPasskey;                       // Valid in PAIRING_PASSKEY
 static EspBleConnectionId pairingConnectionId;        // 0 while not connected
 static bool pairingCancelRequested;                   // Canceled; ends when the connection is closed
 static bool pairingBonded;                            // Made a bond; registered when the connection is closed
 static EspBleBond bondsBeforePairing[BOND_CAPACITY];  // Bonds of the other devices when the pairing started
 static size_t bondsBeforePairingCount;
+
+// Name of the registered keyboard, kept in the NVS with its address, since a bond has no name. The name is valid only
+// while the address is that of the registered keyboard (see SPEC.md)
+struct KeyboardName {
+  uint8_t addressType;  // As in SPEC.md
+  uint8_t address[6];   // Little endian
+  uint8_t nameSize;
+  char name[SCAN_NAME_MAX_SIZE];  // UTF-8, not terminated
+};
+static KeyboardName keyboardName;
+static const size_t KEYBOARD_NAME_HEADER_SIZE = offsetof(KeyboardName, name);
+
+// Search requested while an attempt to connect to the registered keyboard is in progress (started when it ends)
+static bool scanRequested;
+
+// Connection to the registered keyboard, whose input is relayed to the host (see SPEC.md)
+static bool keyboardConnecting;                  // An attempt to connect is in progress
+static EspBleConnectionId keyboardConnectionId;  // 0 while not connected
+static bool keyboardReady;  // Subscribed to the keyboard input after the encryption with the bond: relaying
+
+// State of the connection to the registered keyboard (the values are those of SPEC.md)
+enum KeyboardState : uint8_t {
+  KEYBOARD_IDLE = 0,        // Not connecting (including while searching or pairing)
+  KEYBOARD_CONNECTING = 1,  // Trying to connect
+  KEYBOARD_PREPARING = 2,   // Connected, encrypting and discovering the HID service
+  KEYBOARD_RELAYING = 3,    // Relaying the input
+};
+
+// Boot keyboard report, and the reports waiting to be sent to the host
+struct KeyboardReport {
+  uint8_t modifiers;
+  uint8_t keys[KEYBOARD_REPORT_KEYS];
+};
+static KeyboardReport reportQueue[KEYBOARD_REPORT_QUEUE_SIZE];
+static size_t reportQueueHead;
+static size_t reportQueueCount;
+static KeyboardReport lastQueuedReport;  // What the host will have when the queue has been sent
+
+// Keys in a field of a keyboard input report: each element holds the index of a pressed key (array), or the state of
+// one key (variable)
+struct KeyField {
+  uint16_t bitOffset;      // Of the first element, in the report without the report ID
+  uint8_t bitSize;         // Of an element (1 to 32)
+  uint16_t count;          // Elements
+  bool array;
+  int32_t logicalMinimum;  // Array: the value of the first usage
+  int32_t logicalMaximum;
+  uint16_t usageMinimum;   // Usages on the Keyboard/Keypad page: this range, or the list when usageCount is not 0
+  uint16_t usageMaximum;
+  uint8_t usageCount;
+  uint16_t usages[KEY_FIELD_MAX_USAGES];
+};
+
+// Layout of a keyboard input report
+struct KeyboardFormat {
+  uint8_t reportId;    // 0 when the Report Map has no report IDs
+  uint16_t bitLength;  // Of the whole report, without the report ID
+  uint8_t fieldCount;
+  KeyField fields[KEYBOARD_MAX_FIELDS];
+};
+
+// HID service of the registered keyboard, prepared one GATT operation at a time after the encryption (EspBle queues
+// at most 8 operations)
+enum HidStep : uint8_t {
+  HID_STEP_NONE = 0,         // Not preparing
+  HID_STEP_DISCOVER,         // Discovering the services
+  HID_STEP_READ_REPORT_MAP,  // Reading the Report Map
+  HID_STEP_READ_REFERENCE,   // Reading the Report Reference of each Report
+  HID_STEP_SUBSCRIBE,        // Subscribing to each keyboard input report
+};
+struct HidReport {
+  uint16_t handle;                 // Value handle of the Report characteristic
+  uint16_t referenceHandle;        // Handle of its Report Reference descriptor (0 if it has none)
+  bool notifiable;
+  uint8_t id;                      // Report ID and type, from the Report Reference
+  uint8_t type;
+  const KeyboardFormat *keyboard;  // Layout of a keyboard input report to subscribe to (NULL for the others)
+};
+static HidStep hidStep;
+static size_t hidStepIndex;  // The Report being read or subscribed to
+static uint16_t hidReportMapHandle;
+static HidReport hidReports[HID_MAX_REPORTS];
+static size_t hidReportCount;
+static KeyboardFormat keyboardFormats[KEYBOARD_MAX_FORMATS];
+static size_t keyboardFormatCount;
 
 // Output report from the host (Caps Lock etc.)
 void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
@@ -133,6 +261,43 @@ static bool initNvs() {
   }
   bool written = prefs.putUInt(NVS_KEY_ID, NVS_ID) == sizeof(uint32_t);
   prefs.end();
+  return written;
+}
+
+// Load the name of the registered keyboard from the NVS (none if it is missing or broken)
+static void loadKeyboardName() {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, true)) {
+    return;
+  }
+  KeyboardName loaded = {};
+  size_t size = prefs.getBytes(NVS_KEY_KEYBOARD, &loaded, sizeof(loaded));
+  prefs.end();
+  if (size >= KEYBOARD_NAME_HEADER_SIZE && loaded.nameSize <= SCAN_NAME_MAX_SIZE &&
+      size == KEYBOARD_NAME_HEADER_SIZE + loaded.nameSize) {
+    keyboardName = loaded;
+  }
+}
+
+// Save the name of the keyboard just registered with the address of its bond
+static bool saveKeyboardName(const EspBleBond &bond, const char *name, size_t nameSize) {
+  KeyboardName saved = {};
+  if (!parseAddress(bond.peerAddress, saved.address)) {
+    return false;
+  }
+  saved.addressType = static_cast<uint8_t>(bond.peerAddressType);
+  saved.nameSize = nameSize;
+  memcpy(saved.name, name, nameSize);
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    return false;
+  }
+  size_t size = KEYBOARD_NAME_HEADER_SIZE + nameSize;
+  bool written = prefs.putBytes(NVS_KEY_KEYBOARD, &saved, size) == size;
+  prefs.end();
+  if (written) {
+    keyboardName = saved;
+  }
   return written;
 }
 
@@ -226,9 +391,8 @@ static void onScanResult(const EspBleScanResult &result) {
   }
 }
 
-// Clear the scan result and start the search (restarts it if it is running)
-static bool startScan() {
-  scannedCount = 0;
+// Start the search with the settings of SPEC.md
+static bool beginScan() {
   EspBleScanConfig config;
   // Also receive the scan responses, which often carry the name
   config.active = true;
@@ -236,6 +400,28 @@ static bool startScan() {
   // first seen before it advertises as a keyboard (e.g. before entering pairing mode) would never be listed
   config.wantDuplicates = true;
   return ble.scanner().start(config);
+}
+
+// Clear the scan result and start the search (restarts it if it is running). A search cannot start while connecting
+// (BLE_HS_EBUSY), so during an attempt to connect to the registered keyboard it starts when the attempt ends
+static bool startScan() {
+  scannedCount = 0;
+  if (keyboardConnecting) {
+    scanRequested = true;
+    return true;
+  }
+  return beginScan();
+}
+
+// Stop the search, including a requested one
+static bool stopScan() {
+  scanRequested = false;
+  return ble.scanner().stop();
+}
+
+// Whether the search is running or requested
+static bool isScanning() {
+  return scanRequested || ble.scanner().isScanning();
 }
 
 // Whether the pairing is in progress (see SPEC.md)
@@ -292,7 +478,8 @@ static bool replaceRegistration() {
   return true;
 }
 
-// Start pairing with the device in the scan result (see SPEC.md)
+// Start pairing with the device in the scan result (see SPEC.md). The connection is made in loop() by
+// preparePairing(), after the relay has stopped
 static uint8_t startPairing(uint8_t const *args) {
   if (isPairing()) {
     return RESULT_BLE_FAILED;
@@ -301,36 +488,61 @@ static uint8_t startPairing(uint8_t const *args) {
   if (device == NULL) {
     return RESULT_INVALID_ARGUMENT;
   }
-  EspBleBond target;
-  target.peerAddress = formatAddress(device->address);
-  target.peerAddressType = static_cast<EspBleAddressType>(device->addressType);
+  pairingTarget.peerAddress = formatAddress(device->address);
+  pairingTarget.peerAddressType = static_cast<EspBleAddressType>(device->addressType);
+  pairingTargetNameSize = device->nameSize;
+  memcpy(pairingTargetName, device->name, device->nameSize);
+  pairingPasskey = 0;
+  pairingConnectionId = 0;
+  pairingCancelRequested = false;
+  pairingBonded = false;
+  pairingPreparing = true;
+  pairingState = PAIRING_CONNECTING;
+  scanRequested = false;
+  // A bond can be deleted only without a connection
+  if (keyboardConnectionId != 0) {
+    ble.disconnect(keyboardConnectionId);
+  }
+  return RESULT_SUCCESS;
+}
+
+// Connect to the device to pair with once there is neither a connection nor an attempt to connect
+static void preparePairing() {
+  if (!pairingPreparing) {
+    return;
+  }
+  if (pairingCancelRequested) {
+    pairingPreparing = false;
+    pairingState = PAIRING_IDLE;
+    return;
+  }
+  if (keyboardConnecting || keyboardConnectionId != 0 || ble.connectionCount() != 0) {
+    return;
+  }
+  pairingPreparing = false;
 
   // Delete the bond of the device itself, or the stack would only encrypt with the old keys instead of pairing.
   // Keep the others until the pairing succeeds (see SPEC.md)
   EspBleBond bonds[BOND_CAPACITY];
   size_t count;
   if (!readBonds(bonds, count)) {
-    return RESULT_BLE_FAILED;
+    pairingState = PAIRING_REGISTRATION_FAILED;
+    return;
   }
   bondsBeforePairingCount = 0;
   for (size_t i = 0; i < count; i++) {
-    if (!isSameBond(bonds[i], target)) {
+    if (!isSameBond(bonds[i], pairingTarget)) {
       bondsBeforePairing[bondsBeforePairingCount++] = bonds[i];
     } else if (!ble.deleteBond(bonds[i])) {
-      return RESULT_BLE_FAILED;
+      pairingState = PAIRING_REGISTRATION_FAILED;
+      return;
     }
   }
 
-  pairingPasskey = 0;
-  pairingConnectionId = 0;
-  pairingCancelRequested = false;
-  pairingBonded = false;
   // connect() stops the search first, and the pairing starts as soon as connected (pairOnConnect)
-  if (!ble.connect(target.peerAddress.c_str(), target.peerAddressType)) {
-    return RESULT_BLE_FAILED;
+  if (!ble.connect(pairingTarget.peerAddress.c_str(), pairingTarget.peerAddressType)) {
+    pairingState = PAIRING_CONNECT_FAILED;
   }
-  pairingState = PAIRING_CONNECTING;
-  return RESULT_SUCCESS;
 }
 
 // Cancel the pairing, which ends when the connection is closed (see SPEC.md)
@@ -339,7 +551,8 @@ static void cancelPairing() {
     return;
   }
   pairingCancelRequested = true;
-  // A connection attempt cannot be canceled: onPairingConnected() closes the connection if it is made
+  // A connection attempt cannot be canceled: onPairingConnected() closes the connection if it is made, and
+  // preparePairing() ends the preparation
   if (pairingConnectionId != 0) {
     ble.disconnect(pairingConnectionId);
   }
@@ -347,6 +560,8 @@ static void cancelPairing() {
 
 // Connected to the device to pair with
 static void onPairingConnected(const EspBleConnection &connection) {
+  DEBUG_LOG("[debug] pairing connected: connection %u, %s (type %u)\n", static_cast<unsigned>(connection.id),
+            connection.peerAddress.c_str(), static_cast<unsigned>(connection.peerAddressType));
   if (pairingState != PAIRING_CONNECTING) {
     return;
   }
@@ -378,6 +593,8 @@ static void onPairingPasskey(const EspBlePasskeyDisplayed &event) {
 // The pairing has ended; the registration is replaced after the disconnection, since a bond can be deleted only
 // without a connection
 static void onPairingSecurityChanged(const EspBleSecurityChanged &event) {
+  DEBUG_LOG("[debug] pairing security: success %d, encrypted %d, authenticated %d, bonded %d, %s\n", event.success,
+            event.connection.encrypted, event.connection.authenticated, event.connection.bonded, event.detail.c_str());
   if (event.connection.id != pairingConnectionId) {
     return;
   }
@@ -393,9 +610,691 @@ static void onPairingDisconnected(const EspBleConnection &connection) {
   }
   pairingConnectionId = 0;
   if (pairingBonded) {
-    pairingState = replaceRegistration() ? PAIRING_REGISTERED : PAIRING_SAVE_FAILED;
+    pairingState = replaceRegistration() ? PAIRING_REGISTERED : PAIRING_REGISTRATION_FAILED;
+    // The name is only for showing, so a failure to save it does not undo the registration
+    EspBleBond registered[BOND_CAPACITY];
+    size_t registeredCount;
+    if (pairingState == PAIRING_REGISTERED && readBonds(registered, registeredCount) && registeredCount == 1) {
+      saveKeyboardName(registered[0], pairingTargetName, pairingTargetNameSize);
+    }
+    EspBleBond bonds[BOND_CAPACITY];
+    size_t count = 0;
+    readBonds(bonds, count);
+    DEBUG_LOG("[debug] pairing ended: state %u, %u bonds\n", pairingState, static_cast<unsigned>(count));
+    for (size_t i = 0; i < count; i++) {
+      DEBUG_LOG("[debug]   bond %s (type %u)\n", bonds[i].peerAddress.c_str(),
+                static_cast<unsigned>(bonds[i].peerAddressType));
+    }
   } else {
     pairingState = pairingCancelRequested ? PAIRING_IDLE : PAIRING_PAIR_FAILED;
+  }
+}
+
+// The registered keyboard: the only bond (none if there is no bond or more than one, see SPEC.md)
+static bool readRegisteredKeyboard(EspBleBond &keyboard) {
+  EspBleBond bonds[BOND_CAPACITY];
+  size_t count;
+  if (!readBonds(bonds, count) || count != 1) {
+    return false;
+  }
+  keyboard = bonds[0];
+  return true;
+}
+
+// Keep trying to connect to the registered keyboard, but not while searching or pairing (see SPEC.md)
+static void connectKeyboard() {
+  if (keyboardConnecting || keyboardConnectionId != 0 || isPairing() || isScanning()) {
+    return;
+  }
+  EspBleBond registered;
+  if (!readRegisteredKeyboard(registered)) {
+    static size_t loggedBondCount = SIZE_MAX;
+    if (ble.bondCount() != loggedBondCount) {
+      loggedBondCount = ble.bondCount();
+      DEBUG_LOG("[debug] no registered keyboard: %u bonds\n", static_cast<unsigned>(loggedBondCount));
+    }
+    return;
+  }
+  keyboardConnecting =
+      ble.connect(registered.peerAddress.c_str(), registered.peerAddressType, KEYBOARD_CONNECT_ATTEMPT_MS);
+  DEBUG_LOG("[debug] connect to %s (type %u): %s\n", registered.peerAddress.c_str(),
+            static_cast<unsigned>(registered.peerAddressType),
+            keyboardConnecting ? "started" : ble.lastErrorDetail().c_str());
+}
+
+// Value of a field of a HID report, least significant bit first
+static uint32_t readReportBits(uint8_t const *data, uint32_t bitOffset, uint8_t bitSize) {
+  uint32_t value = 0;
+  for (uint8_t bit = 0; bit < bitSize; bit++) {
+    uint32_t source = bitOffset + bit;
+    if (data[source / 8] & (1 << (source % 8))) {
+      value |= 1UL << bit;
+    }
+  }
+  return value;
+}
+
+// Value of a two's complement number of the size in bits
+static int32_t signExtend(uint32_t value, uint8_t bits) {
+  if (bits == 0 || bits >= 32) {
+    return static_cast<int32_t>(value);
+  }
+  uint32_t sign = 1UL << (bits - 1);
+  return static_cast<int32_t>((value ^ sign) - sign);
+}
+
+// Read the layout of the keyboard input reports from a Report Map (HID 1.11, 6.2.2): the fields of keys on the
+// Keyboard/Keypad page in the application collections of a keyboard. Returns the number of layouts
+static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardFormat *formats, size_t maxFormats) {
+  // Global items, which Push and Pop save and restore
+  struct Globals {
+    uint16_t usagePage;
+    uint32_t logicalMinimum;
+    uint8_t logicalMinimumSize;
+    uint32_t logicalMaximum;
+    uint8_t logicalMaximumSize;
+    uint32_t reportSize;
+    uint32_t reportCount;
+    uint8_t reportId;
+  };
+  const size_t MAX_PUSHED = 4;
+  Globals globals = {};
+  Globals pushed[MAX_PUSHED];
+  size_t pushedCount = 0;
+
+  // Local items. A usage of 4 bytes holds its page in the upper half; a shorter one is on the Usage Page in effect at
+  // the main item (HID 1.11, 6.2.2.8)
+  struct Usage {
+    uint32_t value;
+    bool extended;
+  };
+  Usage usages[KEY_FIELD_MAX_USAGES];
+  size_t usageCount = 0;
+  Usage usageMinimum = {};
+  Usage usageMaximum = {};
+  bool usageRange = false;
+  auto fullUsage = [&globals](const Usage &usage) {
+    return usage.extended ? usage.value : (static_cast<uint32_t>(globals.usagePage) << 16) | usage.value;
+  };
+
+  // Whether each open collection is in the application collection of a keyboard
+  const size_t MAX_DEPTH = 8;
+  bool keyboardCollection[MAX_DEPTH] = {};
+  size_t depth = 0;
+  auto inKeyboard = [&]() { return depth > 0 && keyboardCollection[min(depth, MAX_DEPTH) - 1]; };
+
+  // Length of each input report so far, in bits
+  const size_t MAX_REPORT_IDS = 16;
+  const uint32_t MAX_REPORT_BITS = 0xFFFF;
+  uint8_t reportIds[MAX_REPORT_IDS];
+  uint32_t reportBits[MAX_REPORT_IDS];
+  size_t reportIdCount = 0;
+
+  size_t formatCount = 0;
+  for (size_t offset = 0; offset < size;) {
+    uint8_t prefix = map[offset++];
+    // Long item (none is defined): skip it
+    if (prefix == 0xFE) {
+      if (offset + 2 > size) {
+        break;
+      }
+      offset += 2 + map[offset];
+      continue;
+    }
+    uint8_t dataSize = (prefix & 0x03) == 3 ? 4 : (prefix & 0x03);
+    if (offset + dataSize > size) {
+      break;
+    }
+    uint32_t data = 0;
+    for (uint8_t i = 0; i < dataSize; i++) {
+      data |= static_cast<uint32_t>(map[offset + i]) << (8 * i);
+    }
+    offset += dataSize;
+    uint8_t type = (prefix >> 2) & 0x03;
+    uint8_t tag = prefix >> 4;
+
+    if (type == 1) {  // Global
+      switch (tag) {
+        case 0: globals.usagePage = data; break;
+        case 1: globals.logicalMinimum = data; globals.logicalMinimumSize = dataSize; break;
+        case 2: globals.logicalMaximum = data; globals.logicalMaximumSize = dataSize; break;
+        case 7: globals.reportSize = data; break;
+        case 8: globals.reportId = data; break;
+        case 9: globals.reportCount = data; break;
+        case 10: if (pushedCount < MAX_PUSHED) pushed[pushedCount++] = globals; break;  // Push
+        case 11: if (pushedCount > 0) globals = pushed[--pushedCount]; break;          // Pop
+      }
+      continue;
+    }
+    if (type == 2) {  // Local
+      Usage usage = {data, dataSize == 4};
+      if (tag == 0 && usageCount < KEY_FIELD_MAX_USAGES) {
+        usages[usageCount++] = usage;
+      } else if (tag == 1) {
+        usageMinimum = usage;
+        usageRange = true;
+      } else if (tag == 2) {
+        usageMaximum = usage;
+      }
+      continue;
+    }
+    if (type != 0) {
+      continue;
+    }
+
+    // Main
+    if (tag == 10) {  // Collection
+      // Application collection (1) of a keyboard (Generic Desktop page 0x01, Keyboard 0x06)
+      bool keyboard = inKeyboard() || (data == 1 && usageCount > 0 && fullUsage(usages[0]) == 0x00010006);
+      if (depth < MAX_DEPTH) {
+        keyboardCollection[depth] = keyboard;
+      }
+      depth++;
+    } else if (tag == 12) {  // End Collection
+      if (depth > 0) {
+        depth--;
+      }
+    } else if (tag == 8) {  // Input
+      // Where this item starts in its report
+      size_t report = 0;
+      while (report < reportIdCount && reportIds[report] != globals.reportId) {
+        report++;
+      }
+      if (report == reportIdCount && reportIdCount < MAX_REPORT_IDS) {
+        reportIds[reportIdCount] = globals.reportId;
+        reportBits[reportIdCount++] = 0;
+      }
+      if (report < reportIdCount) {
+        uint32_t bitOffset = reportBits[report];
+        uint32_t itemBits = globals.reportSize <= 32 && globals.reportCount <= MAX_REPORT_BITS
+                                ? globals.reportSize * globals.reportCount
+                                : MAX_REPORT_BITS + 1;
+        reportBits[report] = min(bitOffset + itemBits, MAX_REPORT_BITS + 1);
+
+        // Keys: data (bit 0 clear) in a keyboard collection, on the Keyboard/Keypad page
+        uint32_t firstUsage = usageRange ? fullUsage(usageMinimum) : usageCount > 0 ? fullUsage(usages[0]) : 0;
+        KeyboardFormat *format = NULL;
+        if (inKeyboard() && (data & 0x01) == 0 && (firstUsage >> 16) == USAGE_PAGE_KEYBOARD && globals.reportSize >= 1 &&
+            globals.reportCount >= 1 && bitOffset + itemBits <= MAX_REPORT_BITS) {
+          for (size_t i = 0; i < formatCount; i++) {
+            if (formats[i].reportId == globals.reportId) {
+              format = &formats[i];
+            }
+          }
+          if (format == NULL && formatCount < maxFormats) {
+            format = &formats[formatCount++];
+            memset(format, 0, sizeof(*format));
+            format->reportId = globals.reportId;
+          }
+        }
+        if (format != NULL && format->fieldCount < KEYBOARD_MAX_FIELDS) {
+          KeyField &field = format->fields[format->fieldCount++];
+          field.bitOffset = bitOffset;
+          field.bitSize = globals.reportSize;
+          field.count = globals.reportCount;
+          field.array = (data & 0x02) == 0;
+          field.logicalMinimum = signExtend(globals.logicalMinimum, 8 * globals.logicalMinimumSize);
+          // Unsigned unless the minimum is negative, so that a maximum such as 255 written in one byte is not -1
+          field.logicalMaximum = field.logicalMinimum < 0
+                                     ? signExtend(globals.logicalMaximum, 8 * globals.logicalMaximumSize)
+                                     : static_cast<int32_t>(globals.logicalMaximum);
+          field.usageMinimum = usageRange ? fullUsage(usageMinimum) & 0xFFFF : 0;
+          field.usageMaximum = usageRange ? fullUsage(usageMaximum) & 0xFFFF : 0;
+          field.usageCount = usageRange ? 0 : usageCount;
+          for (size_t i = 0; i < field.usageCount; i++) {
+            field.usages[i] = fullUsage(usages[i]) & 0xFFFF;
+          }
+        }
+      }
+    }
+    // Local items apply only to the main item that follows them
+    usageCount = 0;
+    usageMinimum = {};
+    usageMaximum = {};
+    usageRange = false;
+  }
+
+  for (size_t i = 0; i < formatCount; i++) {
+    for (size_t report = 0; report < reportIdCount; report++) {
+      if (reportIds[report] == formats[i].reportId) {
+        formats[i].bitLength = min(reportBits[report], MAX_REPORT_BITS);
+      }
+    }
+  }
+  return formatCount;
+}
+
+// The usage of an element of a key field: the key of the element at the index of a variable field, or the key at the
+// index held by an element of an array (0 if there is none)
+static uint16_t keyFieldUsage(const KeyField &field, uint32_t index) {
+  if (field.usageCount == 0) {
+    return field.usageMinimum <= field.usageMaximum && index <= static_cast<uint32_t>(field.usageMaximum -
+                                                                                      field.usageMinimum)
+               ? field.usageMinimum + index
+               : 0;
+  }
+  if (index < field.usageCount) {
+    return field.usages[index];
+  }
+  // The last usage also applies to the remaining elements (HID 1.11, 6.2.2.8)
+  return field.array ? 0 : field.usages[field.usageCount - 1];
+}
+
+// Read the keys of a keyboard input report into a boot keyboard report (see SPEC.md). False if the length is not that
+// of the Report Map
+static bool readKeyboardReport(const KeyboardFormat &format, uint8_t const *data, size_t length,
+                               KeyboardReport &report) {
+  if (length != static_cast<size_t>((format.bitLength + 7) / 8)) {
+    return false;
+  }
+  // The pressed usages, one bit each
+  uint8_t pressed[32] = {};
+  for (uint8_t f = 0; f < format.fieldCount; f++) {
+    const KeyField &field = format.fields[f];
+    for (uint32_t i = 0; i < field.count; i++) {
+      uint32_t value = readReportBits(data, field.bitOffset + i * field.bitSize, field.bitSize);
+      uint16_t usage;
+      if (field.array) {
+        int32_t index = field.logicalMinimum < 0 ? signExtend(value, field.bitSize) : static_cast<int32_t>(value);
+        // An out-of-range value is no key (HID 1.11, 6.2.2.5)
+        if (index < field.logicalMinimum || index > field.logicalMaximum) {
+          continue;
+        }
+        usage = keyFieldUsage(field, index - field.logicalMinimum);
+      } else {
+        if (value == 0) {
+          continue;
+        }
+        usage = keyFieldUsage(field, i);
+      }
+      if (usage != 0 && usage < 256) {
+        pressed[usage / 8] |= 1 << (usage % 8);
+      }
+    }
+  }
+  auto isPressed = [&pressed](unsigned usage) { return (pressed[usage / 8] & (1 << (usage % 8))) != 0; };
+
+  report = {};
+  for (uint8_t bit = 0; bit < 8; bit++) {
+    if (isPressed(USAGE_FIRST_MODIFIER + bit)) {
+      report.modifiers |= 1 << bit;
+    }
+  }
+  size_t count = 0;
+  for (unsigned usage = USAGE_FIRST_KEY; usage <= USAGE_LAST_KEY; usage++) {
+    if (isPressed(usage)) {
+      if (count < KEYBOARD_REPORT_KEYS) {
+        report.keys[count] = usage;
+      }
+      count++;
+    }
+  }
+  // Too many keys at once: ErrorRollOver in every slot, with the modifiers still reported (HID 1.11, Appendix C). An
+  // error that the keyboard reports is passed on in the same way
+  uint8_t error = count > KEYBOARD_REPORT_KEYS ? USAGE_ERROR_ROLL_OVER : 0;
+  for (uint8_t usage = USAGE_ERROR_ROLL_OVER; usage <= USAGE_ERROR_UNDEFINED; usage++) {
+    if (isPressed(usage)) {
+      error = usage;
+      break;
+    }
+  }
+  if (error != 0) {
+    memset(report.keys, error, sizeof(report.keys));
+  }
+  return true;
+}
+
+// Queue a report to the host unless it is the state the host will already have. When the queue is full, the last
+// report is replaced, so that the host still ends up in the latest state
+static void queueKeyboardReport(const KeyboardReport &report) {
+  if (memcmp(&report, &lastQueuedReport, sizeof(report)) == 0) {
+    return;
+  }
+  lastQueuedReport = report;
+  if (reportQueueCount == KEYBOARD_REPORT_QUEUE_SIZE) {
+    reportQueue[(reportQueueHead + reportQueueCount - 1) % KEYBOARD_REPORT_QUEUE_SIZE] = report;
+    return;
+  }
+  reportQueue[(reportQueueHead + reportQueueCount) % KEYBOARD_REPORT_QUEUE_SIZE] = report;
+  reportQueueCount++;
+}
+
+// Send the queued reports one at a time whenever the host can take one. Reports are queued because notifications
+// from the keyboard can arrive back to back, before the host has taken the previous report; dropping one would lose a
+// key or leave a key pressed. While the host is not ready (e.g. suspended), the reports are discarded
+static void sendKeyboardReports() {
+  if (!TinyUSBDevice.ready()) {
+    reportQueueCount = 0;
+    return;
+  }
+  if (reportQueueCount == 0 || !keyboard.ready()) {
+    return;
+  }
+  KeyboardReport &report = reportQueue[reportQueueHead];
+  bool sent = keyboard.keyboardReport(0, report.modifiers, report.keys);
+  DEBUG_LOG("[debug] usb report %02x %02x %02x %02x %02x %02x %02x: %s\n", report.modifiers, report.keys[0],
+            report.keys[1], report.keys[2], report.keys[3], report.keys[4], report.keys[5], sent ? "sent" : "failed");
+  if (sent) {
+    reportQueueHead = (reportQueueHead + 1) % KEYBOARD_REPORT_QUEUE_SIZE;
+    reportQueueCount--;
+  }
+}
+
+// Whether a UUID that EspBle reports (the 128-bit form on the Bluetooth base UUID) is the 16-bit UUID written in 4
+// hex digits
+static bool isUuid16(const String &uuid, const char *uuid16) {
+  return uuid.equalsIgnoreCase(uuid16) ||
+         uuid.equalsIgnoreCase(String("0000") + uuid16 + "-0000-1000-8000-00805f9b34fb");
+}
+
+// The layout of the keyboard input report with the ID (NULL if the Report Map has none)
+static const KeyboardFormat *findKeyboardFormat(uint8_t reportId) {
+  for (size_t i = 0; i < keyboardFormatCount; i++) {
+    if (keyboardFormats[i].reportId == reportId) {
+      return &keyboardFormats[i];
+    }
+  }
+  return NULL;
+}
+
+// The HID service of the registered keyboard cannot be used: close the connection, and the next attempt tries again
+static void failHidPreparation(const char *reason) {
+  DEBUG_LOG("[debug] hid preparation failed: %s\n", reason);
+  hidStep = HID_STEP_NONE;
+  ble.disconnect(keyboardConnectionId);
+}
+
+// Find the Report Map and the Reports of the first HID service among the discovered services
+static bool findHidReports() {
+  EspBleConnectionId id = keyboardConnectionId;
+  // The service starts at its handle and ends before the next service
+  uint16_t first = 0;
+  uint16_t next = 0;
+  EspBleGattServiceInfo service;
+  for (size_t i = 0; ble.discoveredService(id, i, service); i++) {
+    if (isUuid16(service.serviceUuid, UUID_HID_SERVICE) && (first == 0 || service.handle < first)) {
+      first = service.handle;
+    }
+  }
+  if (first == 0) {
+    return false;
+  }
+  for (size_t i = 0; ble.discoveredService(id, i, service); i++) {
+    if (service.handle > first && (next == 0 || service.handle < next)) {
+      next = service.handle;
+    }
+  }
+  auto inService = [first, next](uint16_t handle) { return handle > first && (next == 0 || handle < next); };
+
+  hidReportMapHandle = 0;
+  hidReportCount = 0;
+  EspBleGattCharacteristicInfo characteristic;
+  for (size_t i = 0; ble.discoveredCharacteristic(id, i, characteristic, UUID_HID_SERVICE); i++) {
+    if (!inService(characteristic.handle)) {
+      continue;
+    }
+    if (isUuid16(characteristic.characteristicUuid, UUID_REPORT_MAP) && hidReportMapHandle == 0) {
+      hidReportMapHandle = characteristic.handle;
+    } else if (isUuid16(characteristic.characteristicUuid, UUID_REPORT) && hidReportCount < HID_MAX_REPORTS) {
+      hidReports[hidReportCount++] = {characteristic.handle, 0, characteristic.notifiable, 0, 0, NULL};
+    }
+  }
+  // All Reports have the same UUID, so their Report References are matched by the handle of the Report
+  EspBleGattDescriptorInfo descriptor;
+  for (size_t i = 0; ble.discoveredDescriptor(id, i, descriptor, UUID_HID_SERVICE, UUID_REPORT); i++) {
+    if (!isUuid16(descriptor.descriptorUuid, UUID_REPORT_REFERENCE)) {
+      continue;
+    }
+    for (size_t r = 0; r < hidReportCount; r++) {
+      if (hidReports[r].handle == descriptor.characteristicHandle) {
+        hidReports[r].referenceHandle = descriptor.handle;
+      }
+    }
+  }
+  return hidReportMapHandle != 0 && hidReportCount > 0;
+}
+
+// Subscribe to the next keyboard input report; relaying when all are subscribed
+static void subscribeNextKeyboardReport() {
+  while (hidStepIndex < hidReportCount && hidReports[hidStepIndex].keyboard == NULL) {
+    hidStepIndex++;
+  }
+  if (hidStepIndex < hidReportCount) {
+    if (!ble.subscribe(keyboardConnectionId, hidReports[hidStepIndex].handle)) {
+      failHidPreparation("subscribe");
+    }
+    return;
+  }
+  hidStep = HID_STEP_NONE;
+  keyboardReady = true;
+  DEBUG_LOG("[debug] relaying\n");
+}
+
+// Read the Report Reference of the next Report that has one; when all are read, subscribe to the keyboard input
+// reports
+static void readNextReportReference() {
+  while (hidStepIndex < hidReportCount && hidReports[hidStepIndex].referenceHandle == 0) {
+    hidStepIndex++;
+  }
+  if (hidStepIndex < hidReportCount) {
+    if (!ble.readDescriptor(keyboardConnectionId, hidReports[hidStepIndex].referenceHandle)) {
+      failHidPreparation("read a report reference");
+    }
+    return;
+  }
+  bool found = false;
+  for (size_t i = 0; i < hidReportCount; i++) {
+    found = found || hidReports[i].keyboard != NULL;
+  }
+  if (!found) {
+    failHidPreparation("no keyboard input report");
+    return;
+  }
+  hidStep = HID_STEP_SUBSCRIBE;
+  hidStepIndex = 0;
+  subscribeNextKeyboardReport();
+}
+
+// [debug] Print the Reports of the HID service
+static void debugLogHidReports() {
+  DEBUG_LOG("[debug] hid service: report map %u, %u reports\n", hidReportMapHandle,
+            static_cast<unsigned>(hidReportCount));
+  for (size_t i = 0; i < hidReportCount; i++) {
+    DEBUG_LOG("[debug]   report %u: reference %u, notifiable %d\n", hidReports[i].handle, hidReports[i].referenceHandle,
+              hidReports[i].notifiable);
+  }
+}
+
+// [debug] Print the layouts read from the Report Map
+static void debugLogKeyboardFormats(const EspBleGattResult &result) {
+  DEBUG_LOG("[debug] report map: success %d, %u bytes, %u keyboard reports\n", result.success,
+            static_cast<unsigned>(result.value.length()), static_cast<unsigned>(keyboardFormatCount));
+  for (size_t i = 0; i < keyboardFormatCount; i++) {
+    const KeyboardFormat &format = keyboardFormats[i];
+    DEBUG_LOG("[debug]   report id %u: %u bits\n", format.reportId, format.bitLength);
+    for (size_t f = 0; f < format.fieldCount; f++) {
+      const KeyField &field = format.fields[f];
+      DEBUG_LOG("[debug]     %s at bit %u: %u x %u bits, logical %ld..%ld, usages %02x..%02x, %u listed\n",
+                field.array ? "array" : "variable", field.bitOffset, field.count, field.bitSize,
+                static_cast<long>(field.logicalMinimum), static_cast<long>(field.logicalMaximum), field.usageMinimum,
+                field.usageMaximum, field.usageCount);
+    }
+  }
+}
+
+// Connected to the registered keyboard; the encryption with the bond starts by itself (pairOnConnect). If the
+// pairing has started during the attempt, close the connection so that the pairing can go on
+static void onKeyboardConnected(const EspBleConnection &connection) {
+  DEBUG_LOG("[debug] keyboard connected: connection %u, %s (type %u)\n", static_cast<unsigned>(connection.id),
+            connection.peerAddress.c_str(), static_cast<unsigned>(connection.peerAddressType));
+  keyboardConnectionId = connection.id;
+  keyboardReady = false;
+  hidStep = HID_STEP_NONE;
+  if (isPairing()) {
+    ble.disconnect(connection.id);
+  }
+}
+
+// Encrypted with the bond: prepare the HID service to receive the input. Otherwise the device is not the registered
+// keyboard (or has lost the keys), so close the connection
+static void onKeyboardSecurityChanged(const EspBleSecurityChanged &event) {
+  DEBUG_LOG("[debug] keyboard security: success %d, encrypted %d, authenticated %d, bonded %d, %s\n", event.success,
+            event.connection.encrypted, event.connection.authenticated, event.connection.bonded, event.detail.c_str());
+  if (!event.success || !event.connection.bonded) {
+    ble.disconnect(event.connection.id);
+    return;
+  }
+  // Once for a connection
+  if (hidStep != HID_STEP_NONE || keyboardReady) {
+    return;
+  }
+  hidStep = HID_STEP_DISCOVER;
+  if (!ble.discoverServices(event.connection.id)) {
+    failHidPreparation("discover the services");
+  }
+}
+
+// The services of the registered keyboard are discovered: read the Report Map of its HID service
+static void onServicesDiscovered(const EspBleGattResult &result) {
+  if (hidStep != HID_STEP_DISCOVER || result.connectionId != keyboardConnectionId) {
+    return;
+  }
+  if (!result.success || !findHidReports()) {
+    failHidPreparation("no HID service");
+    return;
+  }
+  debugLogHidReports();
+  hidStep = HID_STEP_READ_REPORT_MAP;
+  if (!ble.readCharacteristic(keyboardConnectionId, hidReportMapHandle)) {
+    failHidPreparation("read the report map");
+  }
+}
+
+// The Report Map is read: find the layout of the keyboard input reports, then read the Report References
+static void onCharacteristicRead(const EspBleGattResult &result) {
+  if (hidStep != HID_STEP_READ_REPORT_MAP || result.connectionId != keyboardConnectionId ||
+      result.handle != hidReportMapHandle) {
+    return;
+  }
+  keyboardFormatCount = result.success ? parseKeyboardFormats(reinterpret_cast<uint8_t const *>(result.value.c_str()),
+                                                              result.value.length(), keyboardFormats,
+                                                              KEYBOARD_MAX_FORMATS)
+                                       : 0;
+  debugLogKeyboardFormats(result);
+  if (keyboardFormatCount == 0) {
+    failHidPreparation("no keyboard input in the report map");
+    return;
+  }
+  hidStep = HID_STEP_READ_REFERENCE;
+  hidStepIndex = 0;
+  readNextReportReference();
+}
+
+// A Report Reference is read: the Report is a keyboard input report if it is an input report with the ID of one in
+// the Report Map
+static void onDescriptorRead(const EspBleGattResult &result) {
+  if (hidStep != HID_STEP_READ_REFERENCE || result.connectionId != keyboardConnectionId ||
+      hidStepIndex >= hidReportCount || result.descriptorHandle != hidReports[hidStepIndex].referenceHandle) {
+    return;
+  }
+  if (!result.success || result.value.length() < 2) {
+    failHidPreparation("read a report reference");
+    return;
+  }
+  HidReport &report = hidReports[hidStepIndex];
+  report.id = static_cast<uint8_t>(result.value[0]);
+  report.type = static_cast<uint8_t>(result.value[1]);
+  report.keyboard = report.type == REPORT_TYPE_INPUT && report.notifiable ? findKeyboardFormat(report.id) : NULL;
+  DEBUG_LOG("[debug] report %u: id %u, type %u, keyboard %d\n", report.handle, report.id, report.type,
+            report.keyboard != NULL);
+  hidStepIndex++;
+  readNextReportReference();
+}
+
+// Subscribed to a keyboard input report
+static void onSubscribed(const EspBleGattResult &result) {
+  if (hidStep != HID_STEP_SUBSCRIBE || result.connectionId != keyboardConnectionId || hidStepIndex >= hidReportCount ||
+      result.handle != hidReports[hidStepIndex].handle) {
+    return;
+  }
+  DEBUG_LOG("[debug] subscribed to report %u: success %d, %s\n", result.handle, result.success, result.detail.c_str());
+  if (!result.success) {
+    failHidPreparation("subscribe");
+    return;
+  }
+  hidStepIndex++;
+  subscribeNextKeyboardReport();
+}
+
+// Relay a keyboard input report of the registered keyboard as a boot keyboard report (see SPEC.md). Only the
+// connection encrypted with the bond gets ready to relay
+static void onNotification(const EspBleGattNotification &notification) {
+  if (!keyboardReady || notification.connectionId != keyboardConnectionId) {
+    return;
+  }
+  for (size_t i = 0; i < hidReportCount; i++) {
+    const HidReport &hidReport = hidReports[i];
+    if (hidReport.handle != notification.handle || hidReport.keyboard == NULL) {
+      continue;
+    }
+    uint8_t const *data = reinterpret_cast<uint8_t const *>(notification.value.c_str());
+    KeyboardReport report;
+    bool valid = readKeyboardReport(*hidReport.keyboard, data, notification.value.length(), report);
+    DEBUG_LOG("[debug] input report %u, %u bytes:", hidReport.handle, static_cast<unsigned>(notification.value.length()));
+    for (size_t b = 0; b < notification.value.length(); b++) {
+      DEBUG_LOG(" %02x", data[b]);
+    }
+    DEBUG_LOG(valid ? "\n" : " (length differs from the report map)\n");
+    if (valid) {
+      queueKeyboardReport(report);
+    }
+    return;
+  }
+}
+
+// The connection to the registered keyboard is closed: release every key on the host
+static void onKeyboardDisconnected(const EspBleConnection &connection) {
+  DEBUG_LOG("[debug] keyboard disconnected: reason 0x%02x\n", connection.disconnectReason);
+  keyboardConnectionId = 0;
+  keyboardReady = false;
+  hidStep = HID_STEP_NONE;
+  hidReportCount = 0;
+  queueKeyboardReport(KeyboardReport{});
+}
+
+// Events of the connections, for the registered keyboard or for the device to pair with. Only one attempt to connect
+// runs at a time, and the keyboard is not connected to while pairing
+static void onConnected(const EspBleConnection &connection) {
+  if (keyboardConnecting) {
+    keyboardConnecting = false;
+    onKeyboardConnected(connection);
+  } else {
+    onPairingConnected(connection);
+  }
+}
+
+static void onConnectionFailed(const EspBleConnectionFailure &failure) {
+  DEBUG_LOG("[debug] connection failed: %s, %s\n", failure.peerAddress.c_str(), failure.detail.c_str());
+  if (keyboardConnecting) {
+    keyboardConnecting = false;
+  } else {
+    onPairingConnectionFailed(failure);
+  }
+}
+
+static void onSecurityChanged(const EspBleSecurityChanged &event) {
+  if (keyboardConnectionId != 0 && event.connection.id == keyboardConnectionId) {
+    onKeyboardSecurityChanged(event);
+  } else {
+    onPairingSecurityChanged(event);
+  }
+}
+
+static void onDisconnected(const EspBleConnection &connection) {
+  if (keyboardConnectionId != 0 && connection.id == keyboardConnectionId) {
+    onKeyboardDisconnected(connection);
+  } else {
+    onPairingDisconnected(connection);
   }
 }
 
@@ -414,7 +1313,7 @@ static void sendSettingsResponse(uint8_t command, uint8_t result, uint8_t const 
 // Send the device at the index in the scan result (see SPEC.md)
 static void sendScanResult(uint8_t command, uint8_t index) {
   uint8_t data[SCAN_RESULT_HEADER_SIZE + SCAN_NAME_MAX_SIZE] = {};
-  data[0] = ble.scanner().isScanning() ? 1 : 0;
+  data[0] = isScanning() ? 1 : 0;
   data[1] = scannedCount;
   size_t size = 2;
   if (index < scannedCount) {
@@ -439,6 +1338,34 @@ static void sendPairingState(uint8_t command) {
   sendSettingsResponse(command, RESULT_SUCCESS, data, sizeof(data));
 }
 
+// The state of the connection to the registered keyboard (see SPEC.md)
+static KeyboardState keyboardState() {
+  if (keyboardConnectionId != 0) {
+    return keyboardReady ? KEYBOARD_RELAYING : KEYBOARD_PREPARING;
+  }
+  return keyboardConnecting ? KEYBOARD_CONNECTING : KEYBOARD_IDLE;
+}
+
+// Send the registered keyboard and the state of the connection to it (see SPEC.md)
+static void sendRegistration(uint8_t command) {
+  uint8_t data[REGISTRATION_HEADER_SIZE + SCAN_NAME_MAX_SIZE] = {};
+  size_t size = 1;
+  EspBleBond registered;
+  if (readRegisteredKeyboard(registered) && parseAddress(registered.peerAddress, data + 2)) {
+    data[0] = 1;
+    data[1] = static_cast<uint8_t>(registered.peerAddressType);
+    data[8] = keyboardState();
+    size = REGISTRATION_HEADER_SIZE;
+    // The saved name, only if it is that of the registered keyboard
+    if (keyboardName.addressType == data[1] && memcmp(keyboardName.address, data + 2, 6) == 0) {
+      data[9] = keyboardName.nameSize;
+      memcpy(data + REGISTRATION_HEADER_SIZE, keyboardName.name, keyboardName.nameSize);
+      size += keyboardName.nameSize;
+    }
+  }
+  sendSettingsResponse(command, RESULT_SUCCESS, data, size);
+}
+
 // Handle a request from the settings page
 static void handleSettingsRequest(uint8_t const *request) {
   uint8_t command = request[0];
@@ -454,7 +1381,7 @@ static void handleSettingsRequest(uint8_t const *request) {
       sendSettingsResponse(command, !isPairing() && startScan() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
       break;
     case COMMAND_STOP_SCAN:
-      sendSettingsResponse(command, ble.scanner().stop() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
+      sendSettingsResponse(command, stopScan() ? RESULT_SUCCESS : RESULT_BLE_FAILED, NULL, 0);
       break;
     case COMMAND_GET_SCAN_RESULT:
       sendScanResult(command, request[1]);
@@ -469,6 +1396,9 @@ static void handleSettingsRequest(uint8_t const *request) {
     case COMMAND_GET_PAIRING_STATE:
       sendPairingState(command);
       break;
+    case COMMAND_GET_REGISTRATION:
+      sendRegistration(command);
+      break;
     default:
       sendSettingsResponse(command, RESULT_UNKNOWN_COMMAND, NULL, 0);
       break;
@@ -476,8 +1406,11 @@ static void handleSettingsRequest(uint8_t const *request) {
 }
 
 void setup() {
+  Serial.begin(115200);
+
   // Before anything else uses the NVS (the BLE bonds are kept there)
   initNvs();
+  loadKeyboardName();
 
   settingsRequests = xQueueCreate(4, SETTINGS_REPORT_SIZE);
 
@@ -515,14 +1448,22 @@ void setup() {
   config.security.bonding = true;
   config.security.mitm = true;
   config.security.ioCapability = EspBleSecurityIoCapability::DisplayOnly;
+  // The keyboard input reports are subscribed to after the encryption on every connection. EspBle would restore a
+  // subscription by its UUID as soon as connected, before the encryption
+  config.persistentSubscriptions = false;
   // The scan results and the events of the connections are delivered from ble.update() in loop()
   ble.begin(config);
   ble.scanner().onResult(onScanResult);
-  ble.onConnected(onPairingConnected);
-  ble.onConnectionFailed(onPairingConnectionFailed);
+  ble.onConnected(onConnected);
+  ble.onConnectionFailed(onConnectionFailed);
   ble.onPasskeyDisplayed(onPairingPasskey);
-  ble.onSecurityChanged(onPairingSecurityChanged);
-  ble.onDisconnected(onPairingDisconnected);
+  ble.onSecurityChanged(onSecurityChanged);
+  ble.onDisconnected(onDisconnected);
+  ble.onServicesDiscovered(onServicesDiscovered);
+  ble.onCharacteristicRead(onCharacteristicRead);
+  ble.onDescriptorRead(onDescriptorRead);
+  ble.onSubscribed(onSubscribed);
+  ble.onNotification(onNotification);
 }
 
 void loop() {
@@ -532,6 +1473,15 @@ void loop() {
   }
 
   ble.update();
+
+  // A search requested during an attempt to connect starts when the attempt has ended
+  if (scanRequested && !keyboardConnecting) {
+    scanRequested = false;
+    beginScan();
+  }
+  preparePairing();
+  connectKeyboard();
+  sendKeyboardReports();
 
   delay(LOOP_INTERVAL_MS);
 }

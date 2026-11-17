@@ -9,6 +9,9 @@ const disconnectButton = document.getElementById("disconnect");
 const restartButton = document.getElementById("restart");
 const keyboardCard = document.getElementById("keyboard-card");
 const keyboardMessage = document.getElementById("keyboard-message");
+const registrationName = document.getElementById("registration-name");
+const registrationAddress = document.getElementById("registration-address");
+const registrationState = document.getElementById("registration-state");
 const scanButton = document.getElementById("scan");
 const scanResults = document.getElementById("scan-results");
 const scanDevicesBody = document.getElementById("scan-devices");
@@ -31,6 +34,7 @@ const COMMAND_GET_SCAN_RESULT = 0x06;
 const COMMAND_START_PAIRING = 0x07;
 const COMMAND_CANCEL_PAIRING = 0x08;
 const COMMAND_GET_PAIRING_STATE = 0x09;
+const COMMAND_GET_REGISTRATION = 0x0a;
 const RESULT_SUCCESS = 0x00;
 const RESULT_NAMES = new Map([
   [0x00, "成功"],
@@ -48,13 +52,25 @@ const PAIRING_PASSKEY = 3;
 const PAIRING_REGISTERED = 4;
 const PAIRING_CONNECT_FAILED = 5;
 const PAIRING_PAIR_FAILED = 6;
-const PAIRING_SAVE_FAILED = 7;
+const PAIRING_REGISTRATION_FAILED = 7;
+
+// States of the connection to the registered keyboard (see SPEC.md)
+const KEYBOARD_RELAYING = 3;
+const KEYBOARD_STATE_NAMES = new Map([
+  [0, "つないでいません"],
+  [1, "接続を試しています"],
+  [2, "接続しました（準備中）"],
+  [KEYBOARD_RELAYING, "中継しています"],
+]);
 
 // Time to wait for a response from the device
 const RESPONSE_TIMEOUT_MS = 1000;
 
 // Interval of reading the search result while searching, and the pairing state while pairing
 const POLL_INTERVAL_MS = 500;
+
+// Interval of reading the registration while connected
+const REGISTRATION_POLL_INTERVAL_MS = 1000;
 
 // The opened HID device (null while not connected)
 let device = null;
@@ -71,6 +87,12 @@ const scanRows = [];
 let pairing = null;
 // Changed when the pairing shown on the page is abandoned, so that its loop stops
 let pairingSession = 0;
+
+// Registration shown on the page: null before it is read, { error }, { registered: false }, or
+// { registered: true, address, state, name }
+let registration = null;
+// Changed when the registration shown on the page is abandoned, so that its loop stops
+let registrationSession = 0;
 
 const utf8 = new TextDecoder();
 
@@ -106,6 +128,7 @@ function render() {
     row.pairButton.disabled = !connected || scanState === "stopping" || pairing !== null;
   }
   renderPairing();
+  renderRegistration();
 }
 
 // Show the pairing in progress
@@ -127,6 +150,29 @@ function renderPairing() {
   pairingPasskeyArea.hidden = !showPasskey;
   pairingPasskey.textContent = showPasskey ? String(pairing.passkey).padStart(6, "0") : "";
   pairingCancelButton.disabled = pairing.cancelRequested;
+}
+
+// Show the registered keyboard and the state of the connection to it
+function renderRegistration() {
+  const registered = registration?.registered === true;
+  registrationName.classList.toggle("no-name", registered && !registration.name);
+  if (registration === null) {
+    registrationName.textContent = "読み込んでいます…";
+  } else if (registration.error) {
+    registrationName.textContent = `読み取れませんでした（${registration.error.message}）`;
+  } else if (!registered) {
+    registrationName.textContent = "未登録";
+  } else {
+    registrationName.textContent = registration.name || "（名前なし）";
+  }
+  registrationAddress.hidden = !registered;
+  registrationAddress.textContent = registered ? registration.address : "";
+  registrationState.hidden = !registered;
+  if (registered) {
+    registrationState.textContent =
+      KEYBOARD_STATE_NAMES.get(registration.state) ?? `不明な状態（0x${hex2(registration.state)}）`;
+    registrationState.classList.toggle("connected", registration.state === KEYBOARD_RELAYING);
+  }
 }
 
 // Show the result of an operation in the message area of its card (in red if it is an error)
@@ -339,6 +385,55 @@ async function stopScan() {
   }
 }
 
+// Read the registration (see SPEC.md)
+async function readRegistration() {
+  const response = await request(COMMAND_GET_REGISTRATION);
+  const result = response.getUint8(1);
+  if (result !== RESULT_SUCCESS) {
+    throw new Error(`登録の取得：${resultName(result)}`);
+  }
+  const data = new DataView(response.buffer, response.byteOffset + 2, response.byteLength - 2);
+  if (data.getUint8(0) === 0) {
+    return { registered: false };
+  }
+  const bytes = (offset, size) => new Uint8Array(data.buffer, data.byteOffset + offset, size);
+  return {
+    registered: true,
+    address: formatAddress(bytes(2, 6)),
+    state: data.getUint8(8),
+    name: utf8.decode(bytes(10, data.getUint8(9))),
+  };
+}
+
+// Keep showing the registration while connected (it changes by pairing and by the connection to the keyboard)
+async function watchRegistration() {
+  const session = ++registrationSession;
+  for (;;) {
+    let latest;
+    try {
+      latest = await readRegistration();
+    } catch (error) {
+      latest = { error };
+    }
+    if (session !== registrationSession) {
+      return;
+    }
+    registration = latest;
+    renderRegistration();
+    await sleep(REGISTRATION_POLL_INTERVAL_MS);
+    if (session !== registrationSession) {
+      return;
+    }
+  }
+}
+
+// Abandon the registration shown on the page
+function clearRegistration() {
+  registrationSession++;
+  registration = null;
+  render();
+}
+
 // Read the pairing state (see SPEC.md)
 async function readPairingState() {
   const response = await request(COMMAND_GET_PAIRING_STATE);
@@ -373,8 +468,8 @@ function showPairingResult(name, state) {
     case PAIRING_PAIR_FAILED:
       showMessage(keyboardMessage, `${name} とペアリングできませんでした（パスキーの入力の誤り、時間切れなど）`, true);
       break;
-    case PAIRING_SAVE_FAILED:
-      showMessage(keyboardMessage, `${name} とペアリングできましたが、登録を保存できませんでした`, true);
+    case PAIRING_REGISTRATION_FAILED:
+      showMessage(keyboardMessage, `${name} とペアリングできましたが、登録を書き換えられませんでした`, true);
       break;
     default:
       showMessage(keyboardMessage, `ペアリング：不明な状態（0x${hex2(state)}）`, true);
@@ -449,7 +544,7 @@ function clearPairing() {
   render();
 }
 
-// Let the user choose a device and open it
+// Let the user choose a device, open it and keep showing the registration
 async function connect() {
   const [selected] = await navigator.hid.requestDevice({ filters: DEVICE_FILTERS });
   if (!selected) {
@@ -461,6 +556,7 @@ async function connect() {
   device = selected;
   showMessage(deviceMessage, "");
   render();
+  watchRegistration();
 }
 
 // Close the opened device
@@ -470,6 +566,7 @@ async function disconnect() {
   }
   device = null;
   showMessage(deviceMessage, "");
+  clearRegistration();
   clearPairing();
   clearScan();
 }
@@ -495,6 +592,7 @@ if ("hid" in navigator) {
   navigator.hid.addEventListener("disconnect", (event) => {
     if (event.device === device) {
       device = null;
+      clearRegistration();
       clearPairing();
       clearScan();
     }
