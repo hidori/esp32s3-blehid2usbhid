@@ -154,8 +154,10 @@ static uint8_t pairingTargetNameSize;                 // Name of the device in t
 static char pairingTargetName[SCAN_NAME_MAX_SIZE];
 static uint32_t pairingPasskey;                       // Valid in PAIRING_PASSKEY
 static EspBleConnectionId pairingConnectionId;        // 0 while not connected
+static EspBleConnection pairingConnection;            // As it was when bonded, handed over to the relay
+static bool pairingShortInterval;                     // A short interval has been requested to find the HID service
 static bool pairingCancelRequested;                   // Canceled; ends when the connection is closed
-static bool pairingBonded;                            // Made a bond; registered when the connection is closed
+static bool pairingBonded;                            // Made a bond; registered before the relay or after closing
 static bool pairingNotKeyboard;                       // The HID service shows no keyboard input: not registered
 static EspBleBond bondsBeforePairing[BOND_CAPACITY];  // Bonds of the other devices when the pairing started
 static size_t bondsBeforePairingCount;
@@ -577,7 +579,26 @@ static bool isBondBeforePairing(const EspBleBond &bond) {
   return false;
 }
 
-// Leave only the bond made by the pairing, so that it replaces the registration (needs no connection to delete a bond)
+// Delete the bond of a device that is not connected, even while connected to another one. EspBle's deleteBond() refuses
+// while any connection is open, but NimBLE only deletes what is stored for the device, without touching the
+// connections (ble_gap_unpair() does the same after closing only the connection to that device)
+static bool deleteOldBond(const EspBleBond &bond) {
+  ble_addr_t peers[BOND_CAPACITY];
+  int count = 0;
+  if (ble_store_util_bonded_peers(peers, &count, static_cast<int>(BOND_CAPACITY)) != 0) {
+    return false;
+  }
+  for (int i = 0; i < count; i++) {
+    if (peers[i].type == static_cast<uint8_t>(bond.peerAddressType) &&
+        formatAddress(peers[i].val).equalsIgnoreCase(bond.peerAddress)) {
+      return ble_store_util_delete_peer(&peers[i]) == 0;
+    }
+  }
+  return false;
+}
+
+// Leave only the bond made by the pairing, so that it replaces the registration. The others are deleted without closing
+// the connection of the pairing
 static bool replaceRegistration() {
   EspBleBond bonds[BOND_CAPACITY];
   size_t count;
@@ -593,11 +614,36 @@ static bool replaceRegistration() {
     return count == 1;
   }
   for (size_t i = 0; i < count; i++) {
-    if (isBondBeforePairing(bonds[i]) && !ble.deleteBond(bonds[i])) {
+    if (isBondBeforePairing(bonds[i]) && !deleteOldBond(bonds[i])) {
       return false;
     }
   }
   return true;
+}
+
+// Replace the registration with the bond made by the pairing, and save with it the name in the scan result and the HID
+// service found while pairing. The name is only for showing, and the HID service is discovered on the first connection
+// if it is not remembered, so a failure to save them does not undo the registration
+static bool registerPairedKeyboard() {
+  bool replaced = replaceRegistration();
+  EspBleBond registered[BOND_CAPACITY];
+  size_t registeredCount;
+  if (replaced && readBonds(registered, registeredCount) && registeredCount == 1) {
+    saveKeyboardName(registered[0], pairingTargetName, pairingTargetNameSize);
+    if (pairingCache.version == HID_CACHE_VERSION) {
+      bool saved = saveHidCache(pairingCache, registered[0]);
+      DEBUG_LOG("[debug] remembered hid service saved: %d\n", saved);
+    }
+  }
+  EspBleBond bonds[BOND_CAPACITY];
+  size_t count = 0;
+  readBonds(bonds, count);
+  DEBUG_LOG("[debug] registration replaced: %d, %u bonds\n", replaced, static_cast<unsigned>(count));
+  for (size_t i = 0; i < count; i++) {
+    DEBUG_LOG("[debug]   bond %s (type %u)\n", bonds[i].peerAddress.c_str(),
+              static_cast<unsigned>(bonds[i].peerAddressType));
+  }
+  return replaced;
 }
 
 // Delete the bond made by the pairing, so that the registration stays as it was (needs no connection to delete a bond)
@@ -729,9 +775,8 @@ static void onPairingPasskey(const EspBlePasskeyDisplayed &event) {
   pairingState = PAIRING_PASSKEY;
 }
 
-// The pairing has ended. With a bond, the HID service is found before closing the connection, to remember it and to
-// see that the device is a keyboard (see SPEC.md). The registration is replaced after the disconnection, since a bond
-// can be deleted only without a connection
+// The pairing has ended. With a bond, the HID service is found to remember it and to see that the device is a
+// keyboard, and then the registration is replaced and the connection goes on to the relay (see SPEC.md)
 static void onPairingSecurityChanged(const EspBleSecurityChanged &event) {
   DEBUG_LOG("[debug] pairing security: success %d, encrypted %d, authenticated %d, bonded %d, %s\n", event.success,
             event.connection.encrypted, event.connection.authenticated, event.connection.bonded, event.detail.c_str());
@@ -741,16 +786,17 @@ static void onPairingSecurityChanged(const EspBleSecurityChanged &event) {
   pairingBonded = event.success && event.connection.bonded;
   pairingState = PAIRING_PAIRING;
   if (pairingBonded && !pairingCancelRequested) {
+    pairingConnection = event.connection;
     hidConnectionId = pairingConnectionId;
     hidForPairing = true;
-    askShortInterval(pairingConnectionId, event.connection.supervisionTimeout);
+    pairingShortInterval = askShortInterval(pairingConnectionId, event.connection.supervisionTimeout);
     startHidDiscovery();
     return;
   }
   ble.disconnect(pairingConnectionId);
 }
 
-// The connection to the device to pair with is closed: the end of the pairing
+// The connection to the device to pair with is closed before the relay has taken it over: the end of the pairing
 static void onPairingDisconnected(const EspBleConnection &connection) {
   if (pairingConnectionId == 0 || connection.id != pairingConnectionId) {
     return;
@@ -764,26 +810,8 @@ static void onPairingDisconnected(const EspBleConnection &connection) {
     pairingState = deletePairingBond() ? PAIRING_NOT_KEYBOARD : PAIRING_REGISTRATION_FAILED;
     DEBUG_LOG("[debug] pairing ended: state %u (not a keyboard)\n", pairingState);
   } else if (pairingBonded) {
-    pairingState = replaceRegistration() ? PAIRING_REGISTERED : PAIRING_REGISTRATION_FAILED;
-    // The name is only for showing, and the HID service is discovered on the first connection if it is not
-    // remembered, so a failure to save them does not undo the registration
-    EspBleBond registered[BOND_CAPACITY];
-    size_t registeredCount;
-    if (pairingState == PAIRING_REGISTERED && readBonds(registered, registeredCount) && registeredCount == 1) {
-      saveKeyboardName(registered[0], pairingTargetName, pairingTargetNameSize);
-      if (pairingCache.version == HID_CACHE_VERSION) {
-        bool saved = saveHidCache(pairingCache, registered[0]);
-        DEBUG_LOG("[debug] remembered hid service saved: %d\n", saved);
-      }
-    }
-    EspBleBond bonds[BOND_CAPACITY];
-    size_t count = 0;
-    readBonds(bonds, count);
-    DEBUG_LOG("[debug] pairing ended: state %u, %u bonds\n", pairingState, static_cast<unsigned>(count));
-    for (size_t i = 0; i < count; i++) {
-      DEBUG_LOG("[debug]   bond %s (type %u)\n", bonds[i].peerAddress.c_str(),
-                static_cast<unsigned>(bonds[i].peerAddressType));
-    }
+    pairingState = registerPairedKeyboard() ? PAIRING_REGISTERED : PAIRING_REGISTRATION_FAILED;
+    DEBUG_LOG("[debug] pairing ended: state %u, after closing the connection\n", pairingState);
   } else {
     pairingState = pairingCancelRequested ? PAIRING_IDLE : PAIRING_PAIR_FAILED;
   }
@@ -1432,13 +1460,41 @@ static void checkNextCachedReport() {
   }
 }
 
-// The HID service of the device paired with is found: remember it, and end the pairing by closing the connection. It
-// is saved with the registration after the disconnection
+// Relay on the connection of the pairing, which is encrypted with the bond now registered and whose HID service is
+// found. Closing it would make some keyboards wait for a key before they accept a connection again (see SPEC.md)
+static void relayPairingConnection(const EspBleBond &registered) {
+  keyboardConnectionId = pairingConnectionId;
+  keyboardConnectionHandle = pairingConnection.handle;
+  keyboardTarget = registered;
+  keyboardReady = false;
+  // Not remembered again when the relay starts, unless it could not be saved with the registration
+  keyboardUsesCache = hidCacheMatches(registered);
+  keyboardShortInterval = pairingShortInterval;
+  keyboardInterval = pairingConnection.connectionInterval;
+  keyboardLatency = pairingConnection.peripheralLatency;
+  keyboardSupervisionTimeout = pairingConnection.supervisionTimeout;
+  pairingConnectionId = 0;
+  hidForPairing = false;
+  hidStep = HID_STEP_SUBSCRIBE;
+  hidStepIndex = 0;
+  subscribeNextKeyboardReport();
+}
+
+// The HID service of the device paired with is found: remember it, replace the registration, and relay on this
+// connection. If canceled, or if the registration cannot be replaced, close the connection instead, and the
+// registration is replaced after the disconnection
 static void finishPairingPreparation() {
   hidStep = HID_STEP_NONE;
   bool built = buildHidCache(pairingCache);
   DEBUG_LOG("[debug] pairing: keyboard, hid service %s\n", built ? "remembered" : "not remembered");
-  ble.disconnect(hidConnectionId);
+  EspBleBond registered;
+  if (pairingCancelRequested || !registerPairedKeyboard() || !readRegisteredKeyboard(registered)) {
+    ble.disconnect(hidConnectionId);
+    return;
+  }
+  pairingState = PAIRING_REGISTERED;
+  DEBUG_LOG("[debug] pairing ended: state %u, relay on the connection\n", pairingState);
+  relayPairingConnection(registered);
 }
 
 // Read the Report Reference of the next notifiable Report that has one (the others cannot be keyboard input reports).

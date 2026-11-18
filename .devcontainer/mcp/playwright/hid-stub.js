@@ -32,6 +32,7 @@
   const PAIRING_NOT_KEYBOARD = 8;
   const KEYBOARD_IDLE = 0;
   const KEYBOARD_CONNECTING = 1;
+  const KEYBOARD_PREPARING = 2;
   const KEYBOARD_RELAYING = 3;
 
   // Time until a response arrives, and until the device is disconnected by a restart
@@ -116,7 +117,9 @@
   // Time until the connection is closed after a cancel
   const DISCONNECT_MS = 100;
 
-  // Time until the registered keyboard is connected to (after the pairing, or after a restart)
+  // Time until the relay starts on the connection of the pairing, and until the registered keyboard is connected to
+  // after a restart
+  const RELAY_START_MS = 300;
   const RECONNECT_MS = 1500;
 
   // Search: when it started (null before the first search) and when it stopped (null while searching)
@@ -127,8 +130,8 @@
   // when a canceled pairing ends
   let pairing = null;
 
-  // Registered keyboard: { found, sinceMs } (null if none). It survives a restart like the bonds in the NVS, and the
-  // keyboard is connected to RECONNECT_MS after sinceMs
+  // Registered keyboard: { found, sinceMs, waitState, waitMs } (null if none). It survives a restart like the bonds in
+  // the NVS. The connection is in waitState for waitMs after sinceMs, and relays after that
   let registered = null;
 
   // Devices found by the search so far
@@ -226,7 +229,13 @@
       return;
     }
     const steps = pairing.timeline.steps;
-    registered = { found: pairing.found, sinceMs: pairing.startedMs + steps[steps.length - 1][0] };
+    // The connection of the pairing goes on to the relay
+    registered = {
+      found: pairing.found,
+      sinceMs: pairing.startedMs + steps[steps.length - 1][0],
+      waitState: KEYBOARD_PREPARING,
+      waitMs: RELAY_START_MS,
+    };
     pairing.registeredChecked = true;
   }
 
@@ -240,7 +249,7 @@
     if (isPairing() || (scanStartedMs !== null && scanStoppedMs === null)) {
       state = KEYBOARD_IDLE; // Not connected to while searching or pairing
     } else {
-      state = performance.now() - registered.sinceMs < RECONNECT_MS ? KEYBOARD_CONNECTING : KEYBOARD_RELAYING;
+      state = performance.now() - registered.sinceMs < registered.waitMs ? registered.waitState : KEYBOARD_RELAYING;
     }
     const name = new TextEncoder().encode(registered.found.name);
     return new Uint8Array([1, registered.found.addressType, ...registered.found.address, state, name.length, ...name]);
@@ -342,6 +351,8 @@
       pairing = null;
       if (registered !== null) {
         registered.sinceMs = performance.now();
+        registered.waitState = KEYBOARD_CONNECTING;
+        registered.waitMs = RECONNECT_MS;
       }
       const event = new Event("disconnect");
       event.device = this;
