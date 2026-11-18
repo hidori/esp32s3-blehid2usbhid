@@ -29,6 +29,7 @@
   const PAIRING_REGISTERED = 4;
   const PAIRING_CONNECT_FAILED = 5;
   const PAIRING_PAIR_FAILED = 6;
+  const PAIRING_NOT_KEYBOARD = 8;
   const KEYBOARD_IDLE = 0;
   const KEYBOARD_CONNECTING = 1;
   const KEYBOARD_RELAYING = 3;
@@ -73,6 +74,14 @@
       name: "Stub Faraway",
       pairing: "unreachable",
     },
+    {
+      afterMs: 6000,
+      addressType: 1,
+      address: [0x10, 0x32, 0x54, 0x76, 0x98, 0xda],
+      rssi: -58,
+      name: "Stub Mouse",
+      pairing: "notKeyboard",
+    },
   ];
 
   // How each pairing goes: the states until the times from the start of the pairing, then the end state.
@@ -93,6 +102,11 @@
     unreachable: {
       steps: [[3000, PAIRING_CONNECTING]],
       end: PAIRING_CONNECT_FAILED,
+    },
+    // Paired (Just Works), but the HID service has no keyboard input
+    notKeyboard: {
+      steps: [[1000, PAIRING_CONNECTING], [3500, PAIRING_PAIRING]],
+      end: PAIRING_NOT_KEYBOARD,
     },
   };
 

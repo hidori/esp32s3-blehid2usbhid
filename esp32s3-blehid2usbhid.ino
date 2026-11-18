@@ -3,6 +3,7 @@
 #include <Adafruit_TinyUSB.h>
 #include <EspBle.h>
 #include <Preferences.h>
+#include <host/ble_hs.h>
 #include <esp_mac.h>
 #include <nvs_flash.h>
 
@@ -36,14 +37,23 @@ static_assert(SCAN_RESULT_HEADER_SIZE + SCAN_NAME_MAX_SIZE <= SETTINGS_REPORT_SI
 const uint16_t APPEARANCE_GENERIC_HID = 0x03C0;
 const uint16_t APPEARANCE_KEYBOARD = 0x03C1;
 
-// HID over GATT: the HID service, its Report Map and Reports, the Report Reference of a Report, and the type of an
-// input report in the Report Reference
+// HID over GATT: the HID service, its Report Map and Reports, the descriptors of a Report (Report Reference, and the
+// Client Characteristic Configuration to subscribe), and the type of an input report in the Report Reference
 const char UUID_HID_SERVICE[] = "1812";
 const char UUID_REPORT_MAP[] = "2a4b";
 const char UUID_REPORT[] = "2a4d";
 const char UUID_REPORT_REFERENCE[] = "2908";
+const char UUID_CCCD[] = "2902";
+const uint16_t UUID16_REPORT_REFERENCE = 0x2908;
+const uint16_t UUID16_CCCD = 0x2902;
 const uint8_t REPORT_TYPE_INPUT = 1;
-const size_t HID_MAX_REPORTS = 16;  // Reports of the HID service that are looked at
+const size_t HID_MAX_REPORTS = 16;       // Reports of the HID service that are looked at
+const size_t REPORT_MAP_MAX_SIZE = 512;  // Longest attribute value (Bluetooth Core Specification)
+
+// Notifications and results of the GATT operations made with NimBLE directly, passed from the NimBLE host task to
+// loop(). A longer notification is not relayed (a keyboard input report is far shorter)
+const size_t NIMBLE_EVENT_QUEUE_SIZE = 32;
+const size_t NIMBLE_EVENT_MAX_DATA = 64;
 
 // Pairing state data (see SPEC.md)
 const size_t PAIRING_STATE_SIZE = 5;
@@ -86,8 +96,10 @@ const size_t KEYBOARD_MAX_FORMATS = 4;  // Keyboard input reports (report IDs)
 // NVS (the ID marks that the NVS has been initialized by this firmware)
 const char NVS_NAMESPACE[] = "settings";
 const char NVS_KEY_ID[] = "id";
-const char NVS_KEY_KEYBOARD[] = "keyboard";  // Address and name of the registered keyboard
+const char NVS_KEY_KEYBOARD[] = "keyboard";   // Address and name of the registered keyboard
+const char NVS_KEY_HID_CACHE[] = "hidcache";  // The HID service of the registered keyboard, remembered
 const uint32_t NVS_ID = 0xB1E2B5B0;
+const uint8_t HID_CACHE_VERSION = 1;  // Layout of the remembered HID service; change it when the layout changes
 
 // Keyboard (boot protocol, no report ID so that boot and report protocol share the format)
 uint8_t const descKeyboard[] = {TUD_HID_REPORT_DESC_KEYBOARD()};
@@ -133,6 +145,7 @@ enum PairingState : uint8_t {
   PAIRING_CONNECT_FAILED = 5,       // Failed to connect
   PAIRING_PAIR_FAILED = 6,          // Failed to pair
   PAIRING_REGISTRATION_FAILED = 7,  // Failed to rewrite the registration
+  PAIRING_NOT_KEYBOARD = 8,         // Not registered, since the device has no keyboard input
 };
 static PairingState pairingState = PAIRING_IDLE;
 static bool pairingPreparing;                         // Waiting for the relay to stop before connecting
@@ -143,6 +156,7 @@ static uint32_t pairingPasskey;                       // Valid in PAIRING_PASSKE
 static EspBleConnectionId pairingConnectionId;        // 0 while not connected
 static bool pairingCancelRequested;                   // Canceled; ends when the connection is closed
 static bool pairingBonded;                            // Made a bond; registered when the connection is closed
+static bool pairingNotKeyboard;                       // The HID service shows no keyboard input: not registered
 static EspBleBond bondsBeforePairing[BOND_CAPACITY];  // Bonds of the other devices when the pairing started
 static size_t bondsBeforePairingCount;
 
@@ -164,6 +178,10 @@ static bool scanRequested;
 static bool keyboardConnecting;                  // An attempt to connect is in progress
 static EspBleConnectionId keyboardConnectionId;  // 0 while not connected
 static bool keyboardReady;  // Subscribed to the keyboard input after the encryption with the bond: relaying
+static EspBleBond keyboardTarget;                // The registered keyboard that the attempt connects to
+static uint16_t keyboardConnectionHandle;        // NimBLE handle of the connection
+static bool keyboardUsesCache;                   // Uses the remembered HID service instead of discovering it
+static bool keyboardShortInterval;               // A short interval has been requested for the preparation
 // Parameters of the connection when it was made (units of EspBleConnection), put back when the relay starts
 static uint16_t keyboardInterval;
 static uint16_t keyboardLatency;
@@ -173,7 +191,7 @@ static uint16_t keyboardSupervisionTimeout;
 enum KeyboardState : uint8_t {
   KEYBOARD_IDLE = 0,        // Not connecting (including while searching or pairing)
   KEYBOARD_CONNECTING = 1,  // Trying to connect
-  KEYBOARD_PREPARING = 2,   // Connected, encrypting and discovering the HID service
+  KEYBOARD_PREPARING = 2,   // Connected, encrypting and preparing the HID service
   KEYBOARD_RELAYING = 3,    // Relaying the input
 };
 
@@ -210,30 +228,80 @@ struct KeyboardFormat {
   KeyField fields[KEYBOARD_MAX_FIELDS];
 };
 
-// HID service of the registered keyboard, prepared one GATT operation at a time after the encryption (EspBle queues
-// at most 8 operations)
+// HID service of a keyboard, prepared one GATT operation at a time after the encryption (EspBle queues at most 8
+// operations): discovered with EspBle on the first connection, and checked with NimBLE directly when remembered, since
+// any GATT operation of EspBle discovers the whole database first
 enum HidStep : uint8_t {
-  HID_STEP_NONE = 0,         // Not preparing
-  HID_STEP_DISCOVER,         // Discovering the services
-  HID_STEP_READ_REPORT_MAP,  // Reading the Report Map
-  HID_STEP_READ_REFERENCE,   // Reading the Report Reference of each Report
-  HID_STEP_SUBSCRIBE,        // Subscribing to each keyboard input report
+  HID_STEP_NONE = 0,           // Not preparing
+  HID_STEP_DISCOVER,           // Discovering the services (EspBle)
+  HID_STEP_READ_REPORT_MAP,    // Reading the Report Map (EspBle)
+  HID_STEP_READ_REFERENCE,     // Reading the Report Reference of each Report (EspBle)
+  HID_STEP_CHECK_DESCRIPTORS,  // Checking the descriptors at the remembered handles (NimBLE)
+  HID_STEP_CHECK_REFERENCE,    // Checking the Report Reference at the remembered handle (NimBLE)
+  HID_STEP_SUBSCRIBE,          // Subscribing to each keyboard input report (NimBLE)
 };
 struct HidReport {
   uint16_t handle;                 // Value handle of the Report characteristic
   uint16_t referenceHandle;        // Handle of its Report Reference descriptor (0 if it has none)
+  uint16_t cccdHandle;             // Handle of its Client Characteristic Configuration descriptor (0 if it has none)
   bool notifiable;
   uint8_t id;                      // Report ID and type, from the Report Reference
   uint8_t type;
   const KeyboardFormat *keyboard;  // Layout of a keyboard input report to subscribe to (NULL for the others)
 };
 static HidStep hidStep;
-static size_t hidStepIndex;  // The Report being read or subscribed to
+static EspBleConnectionId hidConnectionId;  // The connection whose HID service is prepared (0 if none)
+static bool hidForPairing;                  // Prepared to remember it while pairing, not to relay
+static size_t hidStepIndex;                 // The Report being read, checked or subscribed to
+static uint8_t hidCheckedDescriptors;       // Descriptors found as remembered for the Report being checked
 static uint16_t hidReportMapHandle;
+static uint8_t hidReportMap[REPORT_MAP_MAX_SIZE];  // The Report Map read, kept to be remembered
+static size_t hidReportMapSize;                    // 0 if it is too long to be kept
 static HidReport hidReports[HID_MAX_REPORTS];
 static size_t hidReportCount;
 static KeyboardFormat keyboardFormats[KEYBOARD_MAX_FORMATS];
 static size_t keyboardFormatCount;
+
+// The HID service of a keyboard, remembered in the NVS so that the connections need no discovery (see SPEC.md): the
+// handles of the keyboard input reports, and the Report Map that tells their layout
+struct CachedReport {
+  uint16_t valueHandle;
+  uint16_t cccdHandle;
+  uint16_t referenceHandle;
+  uint8_t id;
+};
+struct HidCache {
+  uint8_t version;      // HID_CACHE_VERSION (0 if there is none)
+  uint8_t addressType;  // Of the keyboard, as in SPEC.md
+  uint8_t address[6];   // Little endian
+  uint8_t reportCount;
+  CachedReport reports[KEYBOARD_MAX_FORMATS];
+  uint16_t reportMapSize;
+  uint8_t reportMap[REPORT_MAP_MAX_SIZE];
+};
+static const size_t HID_CACHE_HEADER_SIZE = offsetof(HidCache, reportMap);
+static HidCache hidCache;      // Of the registered keyboard
+static HidCache pairingCache;  // Found while pairing, saved when the registration has been replaced
+
+// Notifications and results of the GATT operations made with NimBLE directly, which arrive in the NimBLE host task
+enum NimbleEventType : uint8_t {
+  NIMBLE_NOTIFICATION,  // A notification or an indication
+  NIMBLE_DESCRIPTOR,    // A descriptor found by a discovery
+  NIMBLE_DONE,          // An operation has ended (status 0 on success); the value for a read
+};
+struct NimbleEvent {
+  NimbleEventType type;
+  uint32_t operation;  // Tag of the operation (0 for a notification)
+  uint16_t connectionHandle;
+  uint16_t handle;     // Of the attribute
+  int status;          // 0 on success, otherwise a NimBLE error
+  uint16_t uuid16;     // NIMBLE_DESCRIPTOR: the UUID if it is a 16-bit one, otherwise 0
+  uint8_t length;
+  uint8_t data[NIMBLE_EVENT_MAX_DATA];
+};
+static QueueHandle_t nimbleEvents;
+static struct ble_gap_event_listener nimbleListener;
+static uint32_t nimbleOperation;  // Tag of the operation whose result is awaited
 
 // Output report from the host (Caps Lock etc.)
 void keyboardSetReport(uint8_t reportId, hid_report_type_t type, uint8_t const *buffer, uint16_t size) {
@@ -309,6 +377,50 @@ static bool saveKeyboardName(const EspBleBond &bond, const char *name, size_t na
     keyboardName = saved;
   }
   return written;
+}
+
+// Load the remembered HID service from the NVS (none if it is missing, broken or of another layout)
+static void loadHidCache() {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, true)) {
+    return;
+  }
+  static HidCache loaded;
+  memset(&loaded, 0, sizeof(loaded));
+  size_t size = prefs.getBytes(NVS_KEY_HID_CACHE, &loaded, sizeof(loaded));
+  prefs.end();
+  if (size >= HID_CACHE_HEADER_SIZE && loaded.version == HID_CACHE_VERSION && loaded.reportCount >= 1 &&
+      loaded.reportCount <= KEYBOARD_MAX_FORMATS && loaded.reportMapSize <= REPORT_MAP_MAX_SIZE &&
+      size == HID_CACHE_HEADER_SIZE + loaded.reportMapSize) {
+    hidCache = loaded;
+  }
+}
+
+// Save the remembered HID service with the address of the keyboard of the bond
+static bool saveHidCache(HidCache &cache, const EspBleBond &bond) {
+  if (!parseAddress(bond.peerAddress, cache.address)) {
+    return false;
+  }
+  cache.addressType = static_cast<uint8_t>(bond.peerAddressType);
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    return false;
+  }
+  size_t size = HID_CACHE_HEADER_SIZE + cache.reportMapSize;
+  bool written = prefs.putBytes(NVS_KEY_HID_CACHE, &cache, size) == size;
+  prefs.end();
+  if (written) {
+    hidCache = cache;
+  }
+  return written;
+}
+
+// Whether the remembered HID service is that of the keyboard of the bond
+static bool hidCacheMatches(const EspBleBond &bond) {
+  uint8_t address[6];
+  return hidCache.version == HID_CACHE_VERSION && parseAddress(bond.peerAddress, address) &&
+         hidCache.addressType == static_cast<uint8_t>(bond.peerAddressType) &&
+         memcmp(hidCache.address, address, 6) == 0;
 }
 
 // Wait until the HID interface can send a report (gives up after about 100 ms)
@@ -488,6 +600,21 @@ static bool replaceRegistration() {
   return true;
 }
 
+// Delete the bond made by the pairing, so that the registration stays as it was (needs no connection to delete a bond)
+static bool deletePairingBond() {
+  EspBleBond bonds[BOND_CAPACITY];
+  size_t count;
+  if (!readBonds(bonds, count)) {
+    return false;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (!isBondBeforePairing(bonds[i]) && !ble.deleteBond(bonds[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Start pairing with the device in the scan result (see SPEC.md). The connection is made in loop() by
 // preparePairing(), after the relay has stopped
 static uint8_t startPairing(uint8_t const *args) {
@@ -506,6 +633,8 @@ static uint8_t startPairing(uint8_t const *args) {
   pairingConnectionId = 0;
   pairingCancelRequested = false;
   pairingBonded = false;
+  pairingNotKeyboard = false;
+  pairingCache.version = 0;
   pairingPreparing = true;
   pairingState = PAIRING_CONNECTING;
   scanRequested = false;
@@ -600,16 +729,24 @@ static void onPairingPasskey(const EspBlePasskeyDisplayed &event) {
   pairingState = PAIRING_PASSKEY;
 }
 
-// The pairing has ended; the registration is replaced after the disconnection, since a bond can be deleted only
-// without a connection
+// The pairing has ended. With a bond, the HID service is found before closing the connection, to remember it and to
+// see that the device is a keyboard (see SPEC.md). The registration is replaced after the disconnection, since a bond
+// can be deleted only without a connection
 static void onPairingSecurityChanged(const EspBleSecurityChanged &event) {
   DEBUG_LOG("[debug] pairing security: success %d, encrypted %d, authenticated %d, bonded %d, %s\n", event.success,
             event.connection.encrypted, event.connection.authenticated, event.connection.bonded, event.detail.c_str());
-  if (event.connection.id != pairingConnectionId) {
+  if (event.connection.id != pairingConnectionId || hidConnectionId == pairingConnectionId) {
     return;
   }
   pairingBonded = event.success && event.connection.bonded;
   pairingState = PAIRING_PAIRING;
+  if (pairingBonded && !pairingCancelRequested) {
+    hidConnectionId = pairingConnectionId;
+    hidForPairing = true;
+    askShortInterval(pairingConnectionId, event.connection.supervisionTimeout);
+    startHidDiscovery();
+    return;
+  }
   ble.disconnect(pairingConnectionId);
 }
 
@@ -619,13 +756,25 @@ static void onPairingDisconnected(const EspBleConnection &connection) {
     return;
   }
   pairingConnectionId = 0;
-  if (pairingBonded) {
+  if (hidConnectionId == connection.id) {
+    hidConnectionId = 0;
+    hidStep = HID_STEP_NONE;
+  }
+  if (pairingBonded && pairingNotKeyboard) {
+    pairingState = deletePairingBond() ? PAIRING_NOT_KEYBOARD : PAIRING_REGISTRATION_FAILED;
+    DEBUG_LOG("[debug] pairing ended: state %u (not a keyboard)\n", pairingState);
+  } else if (pairingBonded) {
     pairingState = replaceRegistration() ? PAIRING_REGISTERED : PAIRING_REGISTRATION_FAILED;
-    // The name is only for showing, so a failure to save it does not undo the registration
+    // The name is only for showing, and the HID service is discovered on the first connection if it is not
+    // remembered, so a failure to save them does not undo the registration
     EspBleBond registered[BOND_CAPACITY];
     size_t registeredCount;
     if (pairingState == PAIRING_REGISTERED && readBonds(registered, registeredCount) && registeredCount == 1) {
       saveKeyboardName(registered[0], pairingTargetName, pairingTargetNameSize);
+      if (pairingCache.version == HID_CACHE_VERSION) {
+        bool saved = saveHidCache(pairingCache, registered[0]);
+        DEBUG_LOG("[debug] remembered hid service saved: %d\n", saved);
+      }
     }
     EspBleBond bonds[BOND_CAPACITY];
     size_t count = 0;
@@ -665,6 +814,7 @@ static void connectKeyboard() {
     }
     return;
   }
+  keyboardTarget = registered;
   keyboardConnecting =
       ble.connect(registered.peerAddress.c_str(), registered.peerAddressType, KEYBOARD_CONNECT_ATTEMPT_MS);
   DEBUG_LOG("[debug] connect to %s (type %u): %s\n", registered.peerAddress.c_str(),
@@ -1007,16 +1157,38 @@ static const KeyboardFormat *findKeyboardFormat(uint8_t reportId) {
   return NULL;
 }
 
-// The HID service of the registered keyboard cannot be used: close the connection, and the next attempt tries again
-static void failHidPreparation(const char *reason) {
-  DEBUG_LOG("[debug] hid preparation failed: %s\n", reason);
+// The HID service cannot be prepared: close the connection. For the relay, the next attempt tries again. For the
+// pairing, the device is registered without remembering its HID service, unless the HID service shows that the device
+// is not a keyboard (unusable), see SPEC.md
+static void failHidPreparation(const char *reason, bool unusable) {
+  DEBUG_LOG("[debug] hid preparation failed: %s%s\n", reason, unusable ? " (not a keyboard)" : "");
   hidStep = HID_STEP_NONE;
-  ble.disconnect(keyboardConnectionId);
+  if (hidForPairing) {
+    pairingNotKeyboard = unusable;
+  }
+  ble.disconnect(hidConnectionId);
+}
+
+// Ask for a short connection interval for the preparation of the HID service (see PREPARATION_INTERVAL_MIN)
+static bool askShortInterval(EspBleConnectionId id, uint16_t supervisionTimeout) {
+  bool requested =
+      ble.updateConnectionParameters(id, PREPARATION_INTERVAL_MIN, PREPARATION_INTERVAL_MAX, 0, supervisionTimeout);
+  DEBUG_LOG("[debug] ask for a short connection interval: %d, %s\n", requested, ble.lastErrorDetail().c_str());
+  return requested;
+}
+
+// Discover the HID service with EspBle (the first step without a remembered HID service)
+static void startHidDiscovery() {
+  hidStep = HID_STEP_DISCOVER;
+  hidReportMapSize = 0;
+  if (!ble.discoverServices(hidConnectionId)) {
+    failHidPreparation("discover the services", false);
+  }
 }
 
 // Find the Report Map and the Reports of the first HID service among the discovered services
 static bool findHidReports() {
-  EspBleConnectionId id = keyboardConnectionId;
+  EspBleConnectionId id = hidConnectionId;
   // The service starts at its handle and ends before the next service
   uint16_t first = 0;
   uint16_t next = 0;
@@ -1046,54 +1218,239 @@ static bool findHidReports() {
     if (isUuid16(characteristic.characteristicUuid, UUID_REPORT_MAP) && hidReportMapHandle == 0) {
       hidReportMapHandle = characteristic.handle;
     } else if (isUuid16(characteristic.characteristicUuid, UUID_REPORT) && hidReportCount < HID_MAX_REPORTS) {
-      hidReports[hidReportCount++] = {characteristic.handle, 0, characteristic.notifiable, 0, 0, NULL};
+      HidReport &report = hidReports[hidReportCount++];
+      report = {};
+      report.handle = characteristic.handle;
+      report.notifiable = characteristic.notifiable;
     }
   }
-  // All Reports have the same UUID, so their Report References are matched by the handle of the Report
+  // All Reports have the same UUID, so their descriptors are matched by the handle of the Report
   EspBleGattDescriptorInfo descriptor;
   for (size_t i = 0; ble.discoveredDescriptor(id, i, descriptor, UUID_HID_SERVICE, UUID_REPORT); i++) {
-    if (!isUuid16(descriptor.descriptorUuid, UUID_REPORT_REFERENCE)) {
-      continue;
-    }
+    bool reference = isUuid16(descriptor.descriptorUuid, UUID_REPORT_REFERENCE);
+    bool cccd = isUuid16(descriptor.descriptorUuid, UUID_CCCD);
     for (size_t r = 0; r < hidReportCount; r++) {
-      if (hidReports[r].handle == descriptor.characteristicHandle) {
+      if (hidReports[r].handle != descriptor.characteristicHandle) {
+        continue;
+      }
+      if (reference) {
         hidReports[r].referenceHandle = descriptor.handle;
+      } else if (cccd) {
+        hidReports[r].cccdHandle = descriptor.handle;
       }
     }
   }
   return hidReportMapHandle != 0 && hidReportCount > 0;
 }
 
-// Subscribe to the next keyboard input report; relaying when all are subscribed
+// What to remember of the HID service just discovered: the keyboard input reports and the Report Map. The address is
+// set when it is saved (false if it cannot be kept)
+static bool buildHidCache(HidCache &cache) {
+  memset(&cache, 0, sizeof(cache));
+  if (hidReportMapSize == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < hidReportCount; i++) {
+    const HidReport &report = hidReports[i];
+    if (report.keyboard == NULL) {
+      continue;
+    }
+    if (cache.reportCount >= KEYBOARD_MAX_FORMATS) {
+      return false;
+    }
+    cache.reports[cache.reportCount++] = {report.handle, report.cccdHandle, report.referenceHandle, report.id};
+  }
+  if (cache.reportCount == 0) {
+    return false;
+  }
+  cache.reportMapSize = hidReportMapSize;
+  memcpy(cache.reportMap, hidReportMap, hidReportMapSize);
+  cache.version = HID_CACHE_VERSION;
+  return true;
+}
+
+// Take the remembered HID service as the one to prepare (false if its Report Map has no layout for a report)
+static bool useHidCache() {
+  keyboardFormatCount = parseKeyboardFormats(hidCache.reportMap, hidCache.reportMapSize, keyboardFormats,
+                                             KEYBOARD_MAX_FORMATS);
+  hidReportCount = 0;
+  for (size_t i = 0; i < hidCache.reportCount; i++) {
+    const CachedReport &cached = hidCache.reports[i];
+    HidReport &report = hidReports[hidReportCount++];
+    report = {};
+    report.handle = cached.valueHandle;
+    report.referenceHandle = cached.referenceHandle;
+    report.cccdHandle = cached.cccdHandle;
+    report.notifiable = true;
+    report.id = cached.id;
+    report.type = REPORT_TYPE_INPUT;
+    report.keyboard = findKeyboardFormat(cached.id);
+    if (report.keyboard == NULL) {
+      return false;
+    }
+  }
+  DEBUG_LOG("[debug] use the remembered hid service: %u keyboard reports\n", static_cast<unsigned>(hidReportCount));
+  return hidReportCount > 0;
+}
+
+// The remembered HID service is not that of the keyboard: discover it as on the first connection, and remember it again
+// when the relay starts
+static void rediscoverHidService(const char *reason) {
+  DEBUG_LOG("[debug] remembered hid service not used: %s\n", reason);
+  keyboardUsesCache = false;
+  if (!keyboardShortInterval) {
+    keyboardShortInterval = askShortInterval(keyboardConnectionId, keyboardSupervisionTimeout);
+  }
+  startHidDiscovery();
+}
+
+// Tag passed to a NimBLE GATT operation, and back to loop() with its result
+static void *nimbleOperationTag(uint32_t operation) {
+  return reinterpret_cast<void *>(static_cast<uintptr_t>(operation));
+}
+
+static uint32_t nimbleOperationOf(void *tag) {
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(tag));
+}
+
+// The NimBLE host task passes the events to loop() (an event is lost if the queue is full)
+static void pushNimbleEvent(const NimbleEvent &event) {
+  xQueueSend(nimbleEvents, &event, 0);
+}
+
+// Copy the value of an mbuf into the event (status BLE_HS_EMSGSIZE if it is too long)
+static void copyNimbleData(const struct os_mbuf *om, NimbleEvent &event) {
+  uint16_t length = om == NULL ? 0 : OS_MBUF_PKTLEN(om);
+  uint16_t copied = 0;
+  if (length > NIMBLE_EVENT_MAX_DATA || (length > 0 && ble_hs_mbuf_to_flat(om, event.data, length, &copied) != 0)) {
+    event.status = BLE_HS_EMSGSIZE;
+    return;
+  }
+  event.length = copied;
+}
+
+// NimBLE host task: a notification or an indication from a peer (EspBle passes on only those it subscribed to)
+static int onNimbleGapEvent(struct ble_gap_event *event, void *arg) {
+  if (event->type != BLE_GAP_EVENT_NOTIFY_RX) {
+    return 0;
+  }
+  NimbleEvent result = {};
+  result.type = NIMBLE_NOTIFICATION;
+  result.connectionHandle = event->notify_rx.conn_handle;
+  result.handle = event->notify_rx.attr_handle;
+  copyNimbleData(event->notify_rx.om, result);
+  pushNimbleEvent(result);
+  return 0;
+}
+
+// NimBLE host task: a descriptor found by ble_gattc_disc_all_dscs(), or the end of the discovery
+static int onNimbleDescriptor(uint16_t connectionHandle, const struct ble_gatt_error *error, uint16_t valueHandle,
+                              const struct ble_gatt_dsc *descriptor, void *tag) {
+  NimbleEvent result = {};
+  result.operation = nimbleOperationOf(tag);
+  result.connectionHandle = connectionHandle;
+  if (error->status == 0 && descriptor != NULL) {
+    result.type = NIMBLE_DESCRIPTOR;
+    result.handle = descriptor->handle;
+    result.uuid16 = descriptor->uuid.u.type == BLE_UUID_TYPE_16 ? descriptor->uuid.u16.value : 0;
+  } else {
+    result.type = NIMBLE_DONE;
+    result.status = error->status == BLE_HS_EDONE ? 0 : error->status;
+  }
+  pushNimbleEvent(result);
+  return 0;
+}
+
+// NimBLE host task: the result of ble_gattc_read() or ble_gattc_write_flat()
+static int onNimbleAttribute(uint16_t connectionHandle, const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attribute, void *tag) {
+  NimbleEvent result = {};
+  result.type = NIMBLE_DONE;
+  result.operation = nimbleOperationOf(tag);
+  result.connectionHandle = connectionHandle;
+  result.status = error->status;
+  if (error->status == 0 && attribute != NULL) {
+    result.handle = attribute->handle;
+    copyNimbleData(attribute->om, result);
+  }
+  pushNimbleEvent(result);
+  return 0;
+}
+
+// The relay starts. The parameters of the connection are put back if they were changed for the preparation, and the
+// HID service is remembered if it was discovered
+static void startRelaying() {
+  hidStep = HID_STEP_NONE;
+  keyboardReady = true;
+  DEBUG_LOG("[debug] relaying\n");
+  // So that the relay runs as before the preparation was shortened
+  if (keyboardShortInterval) {
+    bool requested = ble.updateConnectionParameters(keyboardConnectionId, keyboardInterval, keyboardInterval,
+                                                    keyboardLatency, keyboardSupervisionTimeout);
+    DEBUG_LOG("[debug] put back the connection parameters: %d, %s\n", requested, ble.lastErrorDetail().c_str());
+  }
+  if (!keyboardUsesCache) {
+    static HidCache cache;
+    bool saved = buildHidCache(cache) && saveHidCache(cache, keyboardTarget);
+    DEBUG_LOG("[debug] remembered hid service saved: %d\n", saved);
+  }
+}
+
+// Subscribe to the next keyboard input report by writing its Client Characteristic Configuration; relaying when all
+// are subscribed
 static void subscribeNextKeyboardReport() {
   while (hidStepIndex < hidReportCount && hidReports[hidStepIndex].keyboard == NULL) {
     hidStepIndex++;
   }
-  if (hidStepIndex < hidReportCount) {
-    if (!ble.subscribe(keyboardConnectionId, hidReports[hidStepIndex].handle)) {
-      failHidPreparation("subscribe");
-    }
+  if (hidStepIndex >= hidReportCount) {
+    startRelaying();
     return;
   }
-  hidStep = HID_STEP_NONE;
-  keyboardReady = true;
-  DEBUG_LOG("[debug] relaying\n");
-  // Put back the parameters of the connection, so that the relay runs as before the preparation was shortened
-  bool requested = ble.updateConnectionParameters(keyboardConnectionId, keyboardInterval, keyboardInterval,
-                                                  keyboardLatency, keyboardSupervisionTimeout);
-  DEBUG_LOG("[debug] put back the connection parameters: %d, %s\n", requested, ble.lastErrorDetail().c_str());
+  static const uint8_t NOTIFICATIONS_ENABLED[] = {0x01, 0x00};
+  if (ble_gattc_write_flat(keyboardConnectionHandle, hidReports[hidStepIndex].cccdHandle, NOTIFICATIONS_ENABLED,
+                           sizeof(NOTIFICATIONS_ENABLED), onNimbleAttribute,
+                           nimbleOperationTag(++nimbleOperation)) != 0) {
+    failHidPreparation("subscribe", false);
+  }
 }
 
-// Read the Report Reference of the next notifiable Report that has one (the others cannot be keyboard input reports);
-// when all are read, subscribe to the keyboard input reports
+// Check the next remembered keyboard input report: the descriptors at its handles, then its Report Reference.
+// Subscribe when all are as remembered
+static void checkNextCachedReport() {
+  if (hidStepIndex >= hidReportCount) {
+    hidStep = HID_STEP_SUBSCRIBE;
+    hidStepIndex = 0;
+    subscribeNextKeyboardReport();
+    return;
+  }
+  const HidReport &report = hidReports[hidStepIndex];
+  hidStep = HID_STEP_CHECK_DESCRIPTORS;
+  hidCheckedDescriptors = 0;
+  if (ble_gattc_disc_all_dscs(keyboardConnectionHandle, report.handle, max(report.cccdHandle, report.referenceHandle),
+                              onNimbleDescriptor, nimbleOperationTag(++nimbleOperation)) != 0) {
+    rediscoverHidService("cannot discover the descriptors");
+  }
+}
+
+// The HID service of the device paired with is found: remember it, and end the pairing by closing the connection. It
+// is saved with the registration after the disconnection
+static void finishPairingPreparation() {
+  hidStep = HID_STEP_NONE;
+  bool built = buildHidCache(pairingCache);
+  DEBUG_LOG("[debug] pairing: keyboard, hid service %s\n", built ? "remembered" : "not remembered");
+  ble.disconnect(hidConnectionId);
+}
+
+// Read the Report Reference of the next notifiable Report that has one (the others cannot be keyboard input reports).
+// When all are read, subscribe to the keyboard input reports, or end the pairing
 static void readNextReportReference() {
   while (hidStepIndex < hidReportCount &&
          (hidReports[hidStepIndex].referenceHandle == 0 || !hidReports[hidStepIndex].notifiable)) {
     hidStepIndex++;
   }
   if (hidStepIndex < hidReportCount) {
-    if (!ble.readDescriptor(keyboardConnectionId, hidReports[hidStepIndex].referenceHandle)) {
-      failHidPreparation("read a report reference");
+    if (!ble.readDescriptor(hidConnectionId, hidReports[hidStepIndex].referenceHandle)) {
+      failHidPreparation("read a report reference", false);
     }
     return;
   }
@@ -1102,7 +1459,11 @@ static void readNextReportReference() {
     found = found || hidReports[i].keyboard != NULL;
   }
   if (!found) {
-    failHidPreparation("no keyboard input report");
+    failHidPreparation("no keyboard input report", true);
+    return;
+  }
+  if (hidForPairing) {
+    finishPairingPreparation();
     return;
   }
   hidStep = HID_STEP_SUBSCRIBE;
@@ -1110,13 +1471,103 @@ static void readNextReportReference() {
   subscribeNextKeyboardReport();
 }
 
+// A result of a NimBLE GATT operation of the preparation
+static void onNimbleResult(const NimbleEvent &event) {
+  if (hidForPairing || hidConnectionId != keyboardConnectionId || event.connectionHandle != keyboardConnectionHandle ||
+      hidStepIndex >= hidReportCount) {
+    return;
+  }
+  const HidReport &report = hidReports[hidStepIndex];
+  switch (hidStep) {
+    case HID_STEP_CHECK_DESCRIPTORS:
+      if (event.type == NIMBLE_DESCRIPTOR) {
+        if ((event.handle == report.cccdHandle && event.uuid16 == UUID16_CCCD) ||
+            (event.handle == report.referenceHandle && event.uuid16 == UUID16_REPORT_REFERENCE)) {
+          hidCheckedDescriptors++;
+        }
+        return;
+      }
+      DEBUG_LOG("[debug] remembered report %u: status %d, %u descriptors as remembered\n", report.handle, event.status,
+                hidCheckedDescriptors);
+      if (event.status != 0 || hidCheckedDescriptors != 2) {
+        rediscoverHidService("the descriptors differ");
+        return;
+      }
+      hidStep = HID_STEP_CHECK_REFERENCE;
+      if (ble_gattc_read(keyboardConnectionHandle, report.referenceHandle, onNimbleAttribute,
+                         nimbleOperationTag(++nimbleOperation)) != 0) {
+        rediscoverHidService("cannot read the report reference");
+      }
+      return;
+    case HID_STEP_CHECK_REFERENCE:
+      DEBUG_LOG("[debug] remembered report %u: status %d, reference %u bytes\n", report.handle, event.status,
+                event.length);
+      if (event.status != 0 || event.length < 2 || event.data[0] != report.id || event.data[1] != REPORT_TYPE_INPUT) {
+        rediscoverHidService("the report reference differs");
+        return;
+      }
+      hidStepIndex++;
+      checkNextCachedReport();
+      return;
+    case HID_STEP_SUBSCRIBE:
+      DEBUG_LOG("[debug] subscribed to report %u: status %d\n", report.handle, event.status);
+      if (event.status != 0) {
+        failHidPreparation("subscribe", false);
+        return;
+      }
+      hidStepIndex++;
+      subscribeNextKeyboardReport();
+      return;
+    default:
+      return;
+  }
+}
+
+// Relay a keyboard input report of the registered keyboard as a boot keyboard report (see SPEC.md). Only the
+// connection encrypted with the bond gets ready to relay
+static void relayNotification(const NimbleEvent &event) {
+  if (!keyboardReady || event.connectionHandle != keyboardConnectionHandle) {
+    return;
+  }
+  for (size_t i = 0; i < hidReportCount; i++) {
+    const HidReport &hidReport = hidReports[i];
+    if (hidReport.handle != event.handle || hidReport.keyboard == NULL) {
+      continue;
+    }
+    KeyboardReport report;
+    bool valid = event.status == 0 && readKeyboardReport(*hidReport.keyboard, event.data, event.length, report);
+    DEBUG_LOG("[debug] input report %u, %u bytes:", hidReport.handle, event.length);
+    for (size_t b = 0; b < event.length; b++) {
+      DEBUG_LOG(" %02x", event.data[b]);
+    }
+    DEBUG_LOG(valid ? "\n" : " (too long, or the length differs from the report map)\n");
+    if (valid) {
+      queueKeyboardReport(report);
+    }
+    return;
+  }
+}
+
+// Handle the notifications and the results of the NimBLE GATT operations in loop(). A result of an operation that is
+// no longer awaited (e.g. one of a closed connection) is ignored
+static void handleNimbleEvents() {
+  NimbleEvent event;
+  while (xQueueReceive(nimbleEvents, &event, 0) == pdTRUE) {
+    if (event.type == NIMBLE_NOTIFICATION) {
+      relayNotification(event);
+    } else if (event.operation == nimbleOperation) {
+      onNimbleResult(event);
+    }
+  }
+}
+
 // [debug] Print the Reports of the HID service
 static void debugLogHidReports() {
   DEBUG_LOG("[debug] hid service: report map %u, %u reports\n", hidReportMapHandle,
             static_cast<unsigned>(hidReportCount));
   for (size_t i = 0; i < hidReportCount; i++) {
-    DEBUG_LOG("[debug]   report %u: reference %u, notifiable %d\n", hidReports[i].handle, hidReports[i].referenceHandle,
-              hidReports[i].notifiable);
+    DEBUG_LOG("[debug]   report %u: reference %u, cccd %u, notifiable %d\n", hidReports[i].handle,
+              hidReports[i].referenceHandle, hidReports[i].cccdHandle, hidReports[i].notifiable);
   }
 }
 
@@ -1137,17 +1588,19 @@ static void debugLogKeyboardFormats(const EspBleGattResult &result) {
   }
 }
 
-// Connected to the registered keyboard; the encryption with the bond starts by itself (pairOnConnect). Ask for a short
-// connection interval for the preparation of the HID service. If the pairing has started during the attempt, close the
-// connection so that the pairing can go on
+// Connected to the registered keyboard; the encryption with the bond starts by itself (pairOnConnect). Without a
+// remembered HID service, ask for a short connection interval for its discovery. A remembered one needs only a few
+// round trips, which end before a new interval would take effect. If the pairing has started during the attempt, close
+// the connection so that the pairing can go on
 static void onKeyboardConnected(const EspBleConnection &connection) {
   DEBUG_LOG("[debug] keyboard connected: connection %u, %s (type %u), interval %u, latency %u, timeout %u, mtu %u\n",
             static_cast<unsigned>(connection.id), connection.peerAddress.c_str(),
             static_cast<unsigned>(connection.peerAddressType), connection.connectionInterval,
             connection.peripheralLatency, connection.supervisionTimeout, connection.mtu);
   keyboardConnectionId = connection.id;
+  keyboardConnectionHandle = connection.handle;
   keyboardReady = false;
-  hidStep = HID_STEP_NONE;
+  keyboardShortInterval = false;
   if (isPairing()) {
     ble.disconnect(connection.id);
     return;
@@ -1155,9 +1608,11 @@ static void onKeyboardConnected(const EspBleConnection &connection) {
   keyboardInterval = connection.connectionInterval;
   keyboardLatency = connection.peripheralLatency;
   keyboardSupervisionTimeout = connection.supervisionTimeout;
-  bool requested = ble.updateConnectionParameters(connection.id, PREPARATION_INTERVAL_MIN, PREPARATION_INTERVAL_MAX, 0,
-                                                  connection.supervisionTimeout);
-  DEBUG_LOG("[debug] ask for a short connection interval: %d, %s\n", requested, ble.lastErrorDetail().c_str());
+  keyboardUsesCache = hidCacheMatches(keyboardTarget);
+  DEBUG_LOG("[debug] remembered hid service: %d\n", keyboardUsesCache);
+  if (!keyboardUsesCache) {
+    keyboardShortInterval = askShortInterval(connection.id, connection.supervisionTimeout);
+  }
 }
 
 // [debug] Print the connection parameters and the MTU of the connection to the registered keyboard
@@ -1174,8 +1629,8 @@ static void onMtuChanged(const EspBleMtuChanged &event) {
   }
 }
 
-// Encrypted with the bond: prepare the HID service to receive the input. Otherwise the device is not the registered
-// keyboard (or has lost the keys), so close the connection
+// Encrypted with the bond: prepare the HID service to receive the input, with the remembered one if any. Otherwise the
+// device is not the registered keyboard (or has lost the keys), so close the connection
 static void onKeyboardSecurityChanged(const EspBleSecurityChanged &event) {
   DEBUG_LOG("[debug] keyboard security: success %d, encrypted %d, authenticated %d, bonded %d, %s\n", event.success,
             event.connection.encrypted, event.connection.authenticated, event.connection.bonded, event.detail.c_str());
@@ -1184,44 +1639,60 @@ static void onKeyboardSecurityChanged(const EspBleSecurityChanged &event) {
     return;
   }
   // Once for a connection
-  if (hidStep != HID_STEP_NONE || keyboardReady) {
+  if (hidConnectionId == keyboardConnectionId || keyboardReady) {
     return;
   }
-  hidStep = HID_STEP_DISCOVER;
-  if (!ble.discoverServices(event.connection.id)) {
-    failHidPreparation("discover the services");
+  hidConnectionId = keyboardConnectionId;
+  hidForPairing = false;
+  if (!keyboardUsesCache) {
+    startHidDiscovery();
+  } else if (!useHidCache()) {
+    rediscoverHidService("the remembered report map has no layout for a report");
+  } else {
+    hidStepIndex = 0;
+    checkNextCachedReport();
   }
 }
 
-// The services of the registered keyboard are discovered: read the Report Map of its HID service
+// The services are discovered: read the Report Map of the HID service. Without the HID service, the device is not a
+// keyboard
 static void onServicesDiscovered(const EspBleGattResult &result) {
-  if (hidStep != HID_STEP_DISCOVER || result.connectionId != keyboardConnectionId) {
+  if (hidStep != HID_STEP_DISCOVER || result.connectionId != hidConnectionId) {
     return;
   }
-  if (!result.success || !findHidReports()) {
-    failHidPreparation("no HID service");
+  if (!result.success) {
+    failHidPreparation("discover the services", false);
+    return;
+  }
+  if (!findHidReports()) {
+    failHidPreparation("no HID service", true);
     return;
   }
   debugLogHidReports();
   hidStep = HID_STEP_READ_REPORT_MAP;
-  if (!ble.readCharacteristic(keyboardConnectionId, hidReportMapHandle)) {
-    failHidPreparation("read the report map");
+  if (!ble.readCharacteristic(hidConnectionId, hidReportMapHandle)) {
+    failHidPreparation("read the report map", false);
   }
 }
 
-// The Report Map is read: find the layout of the keyboard input reports, then read the Report References
+// The Report Map is read: keep it to be remembered, find the layout of the keyboard input reports, then read the Report
+// References. Without a keyboard input in the Report Map, the device is not a keyboard
 static void onCharacteristicRead(const EspBleGattResult &result) {
-  if (hidStep != HID_STEP_READ_REPORT_MAP || result.connectionId != keyboardConnectionId ||
+  if (hidStep != HID_STEP_READ_REPORT_MAP || result.connectionId != hidConnectionId ||
       result.handle != hidReportMapHandle) {
     return;
   }
-  keyboardFormatCount = result.success ? parseKeyboardFormats(reinterpret_cast<uint8_t const *>(result.value.c_str()),
-                                                              result.value.length(), keyboardFormats,
-                                                              KEYBOARD_MAX_FORMATS)
-                                       : 0;
+  if (!result.success) {
+    failHidPreparation("read the report map", false);
+    return;
+  }
+  uint8_t const *map = reinterpret_cast<uint8_t const *>(result.value.c_str());
+  hidReportMapSize = result.value.length() <= REPORT_MAP_MAX_SIZE ? result.value.length() : 0;
+  memcpy(hidReportMap, map, hidReportMapSize);
+  keyboardFormatCount = parseKeyboardFormats(map, result.value.length(), keyboardFormats, KEYBOARD_MAX_FORMATS);
   debugLogKeyboardFormats(result);
   if (keyboardFormatCount == 0) {
-    failHidPreparation("no keyboard input in the report map");
+    failHidPreparation("no keyboard input in the report map", true);
     return;
   }
   hidStep = HID_STEP_READ_REFERENCE;
@@ -1230,65 +1701,26 @@ static void onCharacteristicRead(const EspBleGattResult &result) {
 }
 
 // A Report Reference is read: the Report is a keyboard input report if it is an input report with the ID of one in
-// the Report Map
+// the Report Map, and can be subscribed to
 static void onDescriptorRead(const EspBleGattResult &result) {
-  if (hidStep != HID_STEP_READ_REFERENCE || result.connectionId != keyboardConnectionId ||
+  if (hidStep != HID_STEP_READ_REFERENCE || result.connectionId != hidConnectionId ||
       hidStepIndex >= hidReportCount || result.descriptorHandle != hidReports[hidStepIndex].referenceHandle) {
     return;
   }
   if (!result.success || result.value.length() < 2) {
-    failHidPreparation("read a report reference");
+    failHidPreparation("read a report reference", false);
     return;
   }
   HidReport &report = hidReports[hidStepIndex];
   report.id = static_cast<uint8_t>(result.value[0]);
   report.type = static_cast<uint8_t>(result.value[1]);
-  report.keyboard = report.type == REPORT_TYPE_INPUT && report.notifiable ? findKeyboardFormat(report.id) : NULL;
+  report.keyboard = report.type == REPORT_TYPE_INPUT && report.notifiable && report.cccdHandle != 0
+                        ? findKeyboardFormat(report.id)
+                        : NULL;
   DEBUG_LOG("[debug] report %u: id %u, type %u, keyboard %d\n", report.handle, report.id, report.type,
             report.keyboard != NULL);
   hidStepIndex++;
   readNextReportReference();
-}
-
-// Subscribed to a keyboard input report
-static void onSubscribed(const EspBleGattResult &result) {
-  if (hidStep != HID_STEP_SUBSCRIBE || result.connectionId != keyboardConnectionId || hidStepIndex >= hidReportCount ||
-      result.handle != hidReports[hidStepIndex].handle) {
-    return;
-  }
-  DEBUG_LOG("[debug] subscribed to report %u: success %d, %s\n", result.handle, result.success, result.detail.c_str());
-  if (!result.success) {
-    failHidPreparation("subscribe");
-    return;
-  }
-  hidStepIndex++;
-  subscribeNextKeyboardReport();
-}
-
-// Relay a keyboard input report of the registered keyboard as a boot keyboard report (see SPEC.md). Only the
-// connection encrypted with the bond gets ready to relay
-static void onNotification(const EspBleGattNotification &notification) {
-  if (!keyboardReady || notification.connectionId != keyboardConnectionId) {
-    return;
-  }
-  for (size_t i = 0; i < hidReportCount; i++) {
-    const HidReport &hidReport = hidReports[i];
-    if (hidReport.handle != notification.handle || hidReport.keyboard == NULL) {
-      continue;
-    }
-    uint8_t const *data = reinterpret_cast<uint8_t const *>(notification.value.c_str());
-    KeyboardReport report;
-    bool valid = readKeyboardReport(*hidReport.keyboard, data, notification.value.length(), report);
-    DEBUG_LOG("[debug] input report %u, %u bytes:", hidReport.handle, static_cast<unsigned>(notification.value.length()));
-    for (size_t b = 0; b < notification.value.length(); b++) {
-      DEBUG_LOG(" %02x", data[b]);
-    }
-    DEBUG_LOG(valid ? "\n" : " (length differs from the report map)\n");
-    if (valid) {
-      queueKeyboardReport(report);
-    }
-    return;
-  }
 }
 
 // The connection to the registered keyboard is closed: release every key on the host
@@ -1296,7 +1728,10 @@ static void onKeyboardDisconnected(const EspBleConnection &connection) {
   DEBUG_LOG("[debug] keyboard disconnected: reason 0x%02x\n", connection.disconnectReason);
   keyboardConnectionId = 0;
   keyboardReady = false;
-  hidStep = HID_STEP_NONE;
+  if (hidConnectionId == connection.id) {
+    hidConnectionId = 0;
+    hidStep = HID_STEP_NONE;
+  }
   hidReportCount = 0;
   queueKeyboardReport(KeyboardReport{});
 }
@@ -1450,8 +1885,10 @@ void setup() {
   // Before anything else uses the NVS (the BLE bonds are kept there)
   initNvs();
   loadKeyboardName();
+  loadHidCache();
 
   settingsRequests = xQueueCreate(4, SETTINGS_REPORT_SIZE);
+  nimbleEvents = xQueueCreate(NIMBLE_EVENT_QUEUE_SIZE, sizeof(NimbleEvent));
 
   uint8_t mac[6];
   esp_efuse_mac_get_default(mac);
@@ -1487,11 +1924,11 @@ void setup() {
   config.security.bonding = true;
   config.security.mitm = true;
   config.security.ioCapability = EspBleSecurityIoCapability::DisplayOnly;
-  // The keyboard input reports are subscribed to after the encryption on every connection. EspBle would restore a
-  // subscription by its UUID as soon as connected, before the encryption
-  config.persistentSubscriptions = false;
   // The scan results and the events of the connections are delivered from ble.update() in loop()
   ble.begin(config);
+  // The keyboard input reports are subscribed to with NimBLE directly, so their notifications are received here too
+  int listened = ble_gap_event_listener_register(&nimbleListener, onNimbleGapEvent, NULL);
+  DEBUG_LOG("[debug] nimble listener: %d\n", listened);
   ble.scanner().onResult(onScanResult);
   ble.onConnected(onConnected);
   ble.onConnectionFailed(onConnectionFailed);
@@ -1501,8 +1938,6 @@ void setup() {
   ble.onServicesDiscovered(onServicesDiscovered);
   ble.onCharacteristicRead(onCharacteristicRead);
   ble.onDescriptorRead(onDescriptorRead);
-  ble.onSubscribed(onSubscribed);
-  ble.onNotification(onNotification);
   ble.onConnectionParametersUpdated(onConnectionParametersUpdated);
   ble.onMtuChanged(onMtuChanged);
 }
@@ -1514,6 +1949,7 @@ void loop() {
   }
 
   ble.update();
+  handleNimbleEvents();
 
   // A search requested during an attempt to connect starts when the attempt has ended
   if (scanRequested && !keyboardConnecting) {

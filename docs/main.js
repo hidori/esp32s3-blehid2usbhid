@@ -53,6 +53,7 @@ const PAIRING_REGISTERED = 4;
 const PAIRING_CONNECT_FAILED = 5;
 const PAIRING_PAIR_FAILED = 6;
 const PAIRING_REGISTRATION_FAILED = 7;
+const PAIRING_NOT_KEYBOARD = 8;
 
 // States of the connection to the registered keyboard (see SPEC.md)
 const KEYBOARD_RELAYING = 3;
@@ -470,6 +471,13 @@ function showPairingResult(name, state) {
       break;
     case PAIRING_REGISTRATION_FAILED:
       showMessage(keyboardMessage, `${name} とペアリングできましたが、登録を書き換えられませんでした`, true);
+      break;
+    case PAIRING_NOT_KEYBOARD:
+      showMessage(
+        keyboardMessage,
+        `${name} はキーボードとして使えないため、登録しませんでした（今の登録はそのままです）`,
+        true,
+      );
       break;
     default:
       showMessage(keyboardMessage, `ペアリング：不明な状態（0x${hex2(state)}）`, true);
