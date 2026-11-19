@@ -81,14 +81,28 @@ const uint8_t USAGE_FIRST_KEY = 0x04;
 const uint8_t USAGE_LAST_KEY = 0xDF;
 const uint8_t USAGE_FIRST_MODIFIER = 0xE0;
 
+// Usages of the HID Consumer page (media keys): those that the consumer control collection sends (see SPEC.md)
+const uint16_t USAGE_PAGE_CONSUMER = 0x0C;
+const uint16_t USAGE_LAST_CONSUMER = 0x3FF;
+
+// Application collections with the keys, as a usage with its page in the upper half: a keyboard (Generic Desktop page,
+// Keyboard) and a consumer control (Consumer page, Consumer Control)
+const uint32_t COLLECTION_KEYBOARD = 0x00010006;
+const uint32_t COLLECTION_CONSUMER_CONTROL = 0x000C0001;
+
 // Keys in a boot keyboard report, and the reports waiting to be sent to the host
 const size_t KEYBOARD_REPORT_KEYS = 6;
 const size_t KEYBOARD_REPORT_QUEUE_SIZE = 16;
 
-// Layout of the keyboard input reports of the BLE keyboard, read from its Report Map
-const size_t KEY_FIELD_MAX_USAGES = 8;  // Usages listed one by one for a field
-const size_t KEYBOARD_MAX_FIELDS = 4;   // Fields with keys in a report
-const size_t KEYBOARD_MAX_FORMATS = 4;  // Keyboard input reports (report IDs)
+// Media key reports waiting to be sent to the host, and the media keys pressed at once that are tracked
+const size_t CONSUMER_REPORT_QUEUE_SIZE = 16;
+const size_t CONSUMER_MAX_PRESSED = 16;
+
+// Layout of the keyboard input reports and the media key reports of the BLE keyboard, read from its Report Map
+const size_t KEY_FIELD_MAX_USAGES = 16;  // Usages listed one by one for a field
+const size_t KEY_MAX_FIELDS = 4;         // Fields with keys in a report
+const size_t KEYBOARD_MAX_FORMATS = 4;   // Keyboard input reports (report IDs)
+const size_t CONSUMER_MAX_FORMATS = 4;   // Media key reports (report IDs)
 
 // NVS (the ID marks that the NVS has been initialized by this firmware)
 const char NVS_NAMESPACE[] = "settings";
@@ -96,14 +110,17 @@ const char NVS_KEY_ID[] = "id";
 const char NVS_KEY_KEYBOARD[] = "keyboard";   // Address and name of the registered keyboard
 const char NVS_KEY_HID_CACHE[] = "hidcache";  // The HID service of the registered keyboard, remembered
 const uint32_t NVS_ID = 0xB1E2B5B0;
-const uint8_t HID_CACHE_VERSION = 1;  // Layout of the remembered HID service; change it when the layout changes
+const uint8_t HID_CACHE_VERSION = 2;  // Layout of the remembered HID service; change it when the layout changes
 
 // Keyboard (boot protocol, no report ID so that boot and report protocol share the format)
 uint8_t const descKeyboard[] = {TUD_HID_REPORT_DESC_KEYBOARD()};
 
-// Consumer control (report ID 1) and vendor-defined settings collection (input and output reports)
+// Consumer control for the media keys: one usage of 0x000-0x3FF at a time, as the sample of Microsoft (see SPEC.md)
+const uint8_t CONSUMER_REPORT_ID = 1;
+
+// Consumer control and vendor-defined settings collection (input and output reports)
 uint8_t const descSettings[] = {
-    TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(1)),
+    TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(CONSUMER_REPORT_ID)),
     TUD_HID_REPORT_DESC_GENERIC_INOUT(SETTINGS_REPORT_SIZE, HID_REPORT_ID(SETTINGS_REPORT_ID)),
 };
 
@@ -194,18 +211,50 @@ enum KeyboardState : uint8_t {
   KEYBOARD_RELAYING = 3,    // Relaying the input
 };
 
+// Reports waiting to be sent to the host. Notifications from the keyboard can arrive back to back, before the host has
+// taken the previous report; dropping one would lose a key or leave a key pressed. A report is queued unless it is the
+// state the host will already have. When the queue is full, the last report is replaced, so that the host still ends
+// up in the latest state
+template <typename Report, size_t SIZE>
+struct ReportQueue {
+  Report reports[SIZE];
+  size_t head;
+  size_t count;
+  Report last;  // What the host will have when the queue has been sent
+
+  void push(const Report &report) {
+    if (memcmp(&report, &last, sizeof(report)) == 0) {
+      return;
+    }
+    last = report;
+    if (count == SIZE) {
+      reports[(head + count - 1) % SIZE] = report;
+      return;
+    }
+    reports[(head + count) % SIZE] = report;
+    count++;
+  }
+
+  const Report &front() const { return reports[head]; }
+
+  void pop() {
+    head = (head + 1) % SIZE;
+    count--;
+  }
+};
+
 // Boot keyboard report, and the reports waiting to be sent to the host
 struct KeyboardReport {
   uint8_t modifiers;
   uint8_t keys[KEYBOARD_REPORT_KEYS];
 };
-static KeyboardReport reportQueue[KEYBOARD_REPORT_QUEUE_SIZE];
-static size_t reportQueueHead;
-static size_t reportQueueCount;
-static KeyboardReport lastQueuedReport;  // What the host will have when the queue has been sent
+static ReportQueue<KeyboardReport, KEYBOARD_REPORT_QUEUE_SIZE> keyboardQueue;
 
-// Keys in a field of a keyboard input report: each element holds the index of a pressed key (array), or the state of
-// one key (variable)
+// Media key reports (the usage of the media key pressed, 0 for none) waiting to be sent to the host
+static ReportQueue<uint16_t, CONSUMER_REPORT_QUEUE_SIZE> consumerQueue;
+
+// Keys in a field of a keyboard input report or a media key report: each element holds the index of a pressed key
+// (array), or the state of one key (variable)
 struct KeyField {
   uint16_t bitOffset;      // Of the first element, in the report without the report ID
   uint8_t bitSize;         // Of an element (1 to 32)
@@ -213,23 +262,34 @@ struct KeyField {
   bool array;
   int32_t logicalMinimum;  // Array: the value of the first usage
   int32_t logicalMaximum;
-  uint16_t usageMinimum;   // Usages on the Keyboard/Keypad page: this range, or the list when usageCount is not 0
+  uint16_t usageMinimum;   // Usages on the page of the keys: this range, or the list when usageCount is not 0
   uint16_t usageMaximum;
   uint8_t usageCount;
+  bool usagesCut;          // More usages are listed than kept: the elements past those kept have no usage
   uint16_t usages[KEY_FIELD_MAX_USAGES];
 };
 
-// Layout of a keyboard input report
-struct KeyboardFormat {
+// Layout of the keys in a keyboard input report or a media key report
+struct KeyFormat {
   uint8_t reportId;    // 0 when the Report Map has no report IDs
   uint16_t bitLength;  // Of the whole report, without the report ID
   uint8_t fieldCount;
-  KeyField fields[KEYBOARD_MAX_FIELDS];
+  KeyField fields[KEY_MAX_FIELDS];
+};
+
+// Called with the usage of each key pressed in a report, in the order of the report
+typedef void (*PressedKeyHandler)(uint16_t usage, void *context);
+
+// Media keys pressed in a media key report, in the order of the report
+struct PressedConsumerKeys {
+  uint8_t count;
+  uint16_t usages[CONSUMER_MAX_PRESSED];
 };
 
 // HID service of a keyboard, prepared one GATT operation at a time after the encryption (EspBle queues at most 8
 // operations): discovered with EspBle on the first connection, and checked with NimBLE directly when remembered, since
-// any GATT operation of EspBle discovers the whole database first
+// any GATT operation of EspBle discovers the whole database first. The keyboard input reports are subscribed to first,
+// and the media key reports after the relay has started (see SPEC.md)
 enum HidStep : uint8_t {
   HID_STEP_NONE = 0,           // Not preparing
   HID_STEP_DISCOVER,           // Discovering the services (EspBle)
@@ -246,11 +306,18 @@ struct HidReport {
   bool notifiable;
   uint8_t id;                      // Report ID and type, from the Report Reference
   uint8_t type;
-  const KeyboardFormat *keyboard;  // Layout of a keyboard input report to subscribe to (NULL for the others)
+  // Layouts of a keyboard input report and of a media key report to subscribe to (NULL for the others)
+  const KeyFormat *keyboard;
+  const KeyFormat *consumer;
+  bool subscribed;                 // Its notifications are relayed
+  // Media keys pressed in its last notification
+  PressedConsumerKeys consumerPressed;
 };
 static HidStep hidStep;
 static EspBleConnectionId hidConnectionId;  // The connection whose HID service is prepared (0 if none)
 static bool hidForPairing;                  // Prepared to remember it while pairing, not to relay
+static bool hidCheckReports;                // The Reports are the remembered ones, checked before subscribing
+static bool hidConsumerPhase;               // Preparing the media key reports, after the relay has started
 static size_t hidStepIndex;                 // The Report being read, checked or subscribed to
 static uint8_t hidCheckedDescriptors;       // Descriptors found as remembered for the Report being checked
 static uint16_t hidReportMapHandle;
@@ -258,11 +325,14 @@ static uint8_t hidReportMap[REPORT_MAP_MAX_SIZE];  // The Report Map read, kept 
 static size_t hidReportMapSize;                    // 0 if it is too long to be kept
 static HidReport hidReports[HID_MAX_REPORTS];
 static size_t hidReportCount;
-static KeyboardFormat keyboardFormats[KEYBOARD_MAX_FORMATS];
+static KeyFormat keyboardFormats[KEYBOARD_MAX_FORMATS];
 static size_t keyboardFormatCount;
+static KeyFormat consumerFormats[CONSUMER_MAX_FORMATS];
+static size_t consumerFormatCount;
 
 // The HID service of a keyboard, remembered in the NVS so that the connections need no discovery (see SPEC.md): the
-// handles of the keyboard input reports, and the Report Map that tells their layout
+// handles of the keyboard input reports and the media key reports, and the Report Map that tells their layout
+const size_t HID_CACHE_MAX_REPORTS = KEYBOARD_MAX_FORMATS + CONSUMER_MAX_FORMATS;
 struct CachedReport {
   uint16_t valueHandle;
   uint16_t cccdHandle;
@@ -274,7 +344,7 @@ struct HidCache {
   uint8_t addressType;  // Of the keyboard, as in SPEC.md
   uint8_t address[6];   // Little endian
   uint8_t reportCount;
-  CachedReport reports[KEYBOARD_MAX_FORMATS];
+  CachedReport reports[HID_CACHE_MAX_REPORTS];
   uint16_t reportMapSize;
   uint8_t reportMap[REPORT_MAP_MAX_SIZE];
 };
@@ -389,7 +459,7 @@ static void loadHidCache() {
   size_t size = prefs.getBytes(NVS_KEY_HID_CACHE, &loaded, sizeof(loaded));
   prefs.end();
   if (size >= HID_CACHE_HEADER_SIZE && loaded.version == HID_CACHE_VERSION && loaded.reportCount >= 1 &&
-      loaded.reportCount <= KEYBOARD_MAX_FORMATS && loaded.reportMapSize <= REPORT_MAP_MAX_SIZE &&
+      loaded.reportCount <= HID_CACHE_MAX_REPORTS && loaded.reportMapSize <= REPORT_MAP_MAX_SIZE &&
       size == HID_CACHE_HEADER_SIZE + loaded.reportMapSize) {
     hidCache = loaded;
   }
@@ -412,6 +482,16 @@ static bool saveHidCache(HidCache &cache, const EspBleBond &bond) {
     hidCache = cache;
   }
   return written;
+}
+
+// Forget the remembered HID service, so that the next connection discovers it and remembers it again
+static void forgetHidCache() {
+  hidCache.version = 0;
+  Preferences prefs;
+  if (prefs.begin(NVS_NAMESPACE, false)) {
+    prefs.remove(NVS_KEY_HID_CACHE);
+    prefs.end();
+  }
 }
 
 // Whether the remembered HID service is that of the keyboard of the bond
@@ -845,9 +925,11 @@ static int32_t signExtend(uint32_t value, uint8_t bits) {
   return static_cast<int32_t>((value ^ sign) - sign);
 }
 
-// Read the layout of the keyboard input reports from a Report Map (HID 1.11, 6.2.2): the fields of keys on the
-// Keyboard/Keypad page in the application collections of a keyboard. Returns the number of layouts
-static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardFormat *formats, size_t maxFormats) {
+// Read the layout of the reports with keys from a Report Map (HID 1.11, 6.2.2): the fields of keys on the page in the
+// application collections of the usage (a keyboard: Keyboard/Keypad page, a consumer control: Consumer page). Returns
+// the number of layouts
+static size_t parseKeyFormats(uint8_t const *map, size_t size, uint32_t collection, uint16_t usagePage,
+                              KeyFormat *formats, size_t maxFormats) {
   // Global items, which Push and Pop save and restore
   struct Globals {
     uint16_t usagePage;
@@ -872,6 +954,7 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
   };
   Usage usages[KEY_FIELD_MAX_USAGES];
   size_t usageCount = 0;
+  bool usagesCut = false;
   Usage usageMinimum = {};
   Usage usageMaximum = {};
   bool usageRange = false;
@@ -879,11 +962,11 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
     return usage.extended ? usage.value : (static_cast<uint32_t>(globals.usagePage) << 16) | usage.value;
   };
 
-  // Whether each open collection is in the application collection of a keyboard
+  // Whether each open collection is in an application collection of the usage
   const size_t MAX_DEPTH = 8;
-  bool keyboardCollection[MAX_DEPTH] = {};
+  bool targetCollection[MAX_DEPTH] = {};
   size_t depth = 0;
-  auto inKeyboard = [&]() { return depth > 0 && keyboardCollection[min(depth, MAX_DEPTH) - 1]; };
+  auto inTarget = [&]() { return depth > 0 && targetCollection[min(depth, MAX_DEPTH) - 1]; };
 
   // Length of each input report so far, in bits
   const size_t MAX_REPORT_IDS = 16;
@@ -930,8 +1013,12 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
     }
     if (type == 2) {  // Local
       Usage usage = {data, dataSize == 4};
-      if (tag == 0 && usageCount < KEY_FIELD_MAX_USAGES) {
-        usages[usageCount++] = usage;
+      if (tag == 0) {
+        if (usageCount < KEY_FIELD_MAX_USAGES) {
+          usages[usageCount++] = usage;
+        } else {
+          usagesCut = true;
+        }
       } else if (tag == 1) {
         usageMinimum = usage;
         usageRange = true;
@@ -946,10 +1033,10 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
 
     // Main
     if (tag == 10) {  // Collection
-      // Application collection (1) of a keyboard (Generic Desktop page 0x01, Keyboard 0x06)
-      bool keyboard = inKeyboard() || (data == 1 && usageCount > 0 && fullUsage(usages[0]) == 0x00010006);
+      // Application collection (1) of the usage
+      bool target = inTarget() || (data == 1 && usageCount > 0 && fullUsage(usages[0]) == collection);
       if (depth < MAX_DEPTH) {
-        keyboardCollection[depth] = keyboard;
+        targetCollection[depth] = target;
       }
       depth++;
     } else if (tag == 12) {  // End Collection
@@ -973,10 +1060,10 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
                                 : MAX_REPORT_BITS + 1;
         reportBits[report] = min(bitOffset + itemBits, MAX_REPORT_BITS + 1);
 
-        // Keys: data (bit 0 clear) in a keyboard collection, on the Keyboard/Keypad page
+        // Keys: data (bit 0 clear) in a collection of the usage, on the page of the keys
         uint32_t firstUsage = usageRange ? fullUsage(usageMinimum) : usageCount > 0 ? fullUsage(usages[0]) : 0;
-        KeyboardFormat *format = NULL;
-        if (inKeyboard() && (data & 0x01) == 0 && (firstUsage >> 16) == USAGE_PAGE_KEYBOARD && globals.reportSize >= 1 &&
+        KeyFormat *format = NULL;
+        if (inTarget() && (data & 0x01) == 0 && (firstUsage >> 16) == usagePage && globals.reportSize >= 1 &&
             globals.reportCount >= 1 && bitOffset + itemBits <= MAX_REPORT_BITS) {
           for (size_t i = 0; i < formatCount; i++) {
             if (formats[i].reportId == globals.reportId) {
@@ -989,7 +1076,7 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
             format->reportId = globals.reportId;
           }
         }
-        if (format != NULL && format->fieldCount < KEYBOARD_MAX_FIELDS) {
+        if (format != NULL && format->fieldCount < KEY_MAX_FIELDS) {
           KeyField &field = format->fields[format->fieldCount++];
           field.bitOffset = bitOffset;
           field.bitSize = globals.reportSize;
@@ -1003,6 +1090,7 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
           field.usageMinimum = usageRange ? fullUsage(usageMinimum) & 0xFFFF : 0;
           field.usageMaximum = usageRange ? fullUsage(usageMaximum) & 0xFFFF : 0;
           field.usageCount = usageRange ? 0 : usageCount;
+          field.usagesCut = !usageRange && usagesCut;
           for (size_t i = 0; i < field.usageCount; i++) {
             field.usages[i] = fullUsage(usages[i]) & 0xFFFF;
           }
@@ -1011,6 +1099,7 @@ static size_t parseKeyboardFormats(uint8_t const *map, size_t size, KeyboardForm
     }
     // Local items apply only to the main item that follows them
     usageCount = 0;
+    usagesCut = false;
     usageMinimum = {};
     usageMaximum = {};
     usageRange = false;
@@ -1038,19 +1127,17 @@ static uint16_t keyFieldUsage(const KeyField &field, uint32_t index) {
   if (index < field.usageCount) {
     return field.usages[index];
   }
-  // The last usage also applies to the remaining elements (HID 1.11, 6.2.2.8)
-  return field.array ? 0 : field.usages[field.usageCount - 1];
+  // The last usage also applies to the remaining elements (HID 1.11, 6.2.2.8), unless more were listed than kept
+  return field.array || field.usagesCut ? 0 : field.usages[field.usageCount - 1];
 }
 
-// Read the keys of a keyboard input report into a boot keyboard report (see SPEC.md). False if the length is not that
-// of the Report Map
-static bool readKeyboardReport(const KeyboardFormat &format, uint8_t const *data, size_t length,
-                               KeyboardReport &report) {
-  if (length != static_cast<size_t>((format.bitLength + 7) / 8)) {
-    return false;
-  }
-  // The pressed usages, one bit each
-  uint8_t pressed[32] = {};
+// Whether the length of a report is that of its layout in the Report Map
+static bool hasReportLength(const KeyFormat &format, size_t length) {
+  return length == static_cast<size_t>((format.bitLength + 7) / 8);
+}
+
+// Call the handler with the usage of each key pressed in a report, in the order of the report
+static void readPressedKeys(const KeyFormat &format, uint8_t const *data, PressedKeyHandler handler, void *context) {
   for (uint8_t f = 0; f < format.fieldCount; f++) {
     const KeyField &field = format.fields[f];
     for (uint32_t i = 0; i < field.count; i++) {
@@ -1069,11 +1156,28 @@ static bool readKeyboardReport(const KeyboardFormat &format, uint8_t const *data
         }
         usage = keyFieldUsage(field, i);
       }
-      if (usage != 0 && usage < 256) {
-        pressed[usage / 8] |= 1 << (usage % 8);
+      if (usage != 0) {
+        handler(usage, context);
       }
     }
   }
+}
+
+// Read the keys of a keyboard input report into a boot keyboard report (see SPEC.md). False if the length is not that
+// of the Report Map
+static bool readKeyboardReport(const KeyFormat &format, uint8_t const *data, size_t length, KeyboardReport &report) {
+  if (!hasReportLength(format, length)) {
+    return false;
+  }
+  // The pressed usages, one bit each
+  uint8_t pressed[32] = {};
+  readPressedKeys(format, data,
+                  [](uint16_t usage, void *context) {
+                    if (usage < 256) {
+                      static_cast<uint8_t *>(context)[usage / 8] |= 1 << (usage % 8);
+                    }
+                  },
+                  pressed);
   auto isPressed = [&pressed](unsigned usage) { return (pressed[usage / 8] & (1 << (usage % 8))) != 0; };
 
   report = {};
@@ -1106,36 +1210,68 @@ static bool readKeyboardReport(const KeyboardFormat &format, uint8_t const *data
   return true;
 }
 
-// Queue a report to the host unless it is the state the host will already have. When the queue is full, the last
-// report is replaced, so that the host still ends up in the latest state
-static void queueKeyboardReport(const KeyboardReport &report) {
-  if (memcmp(&report, &lastQueuedReport, sizeof(report)) == 0) {
-    return;
+// Whether the usage is among the usages
+static bool containsUsage(uint16_t const *usages, uint8_t count, uint16_t usage) {
+  for (uint8_t i = 0; i < count; i++) {
+    if (usages[i] == usage) {
+      return true;
+    }
   }
-  lastQueuedReport = report;
-  if (reportQueueCount == KEYBOARD_REPORT_QUEUE_SIZE) {
-    reportQueue[(reportQueueHead + reportQueueCount - 1) % KEYBOARD_REPORT_QUEUE_SIZE] = report;
-    return;
-  }
-  reportQueue[(reportQueueHead + reportQueueCount) % KEYBOARD_REPORT_QUEUE_SIZE] = report;
-  reportQueueCount++;
+  return false;
 }
 
-// Send the queued reports one at a time whenever the host can take one. Reports are queued because notifications
-// from the keyboard can arrive back to back, before the host has taken the previous report; dropping one would lose a
-// key or leave a key pressed. While the host is not ready (e.g. suspended), the reports are discarded
-static void sendKeyboardReports() {
+// Read the media keys pressed in a media key report: those that the host can be sent (see SPEC.md). False if the
+// length is not that of the Report Map
+static bool readConsumerReport(const KeyFormat &format, uint8_t const *data, size_t length,
+                               PressedConsumerKeys &pressed) {
+  if (!hasReportLength(format, length)) {
+    return false;
+  }
+  pressed.count = 0;
+  readPressedKeys(format, data,
+                  [](uint16_t usage, void *context) {
+                    PressedConsumerKeys &keys = *static_cast<PressedConsumerKeys *>(context);
+                    if (usage <= USAGE_LAST_CONSUMER && keys.count < CONSUMER_MAX_PRESSED &&
+                        !containsUsage(keys.usages, keys.count, usage)) {
+                      keys.usages[keys.count++] = usage;
+                    }
+                  },
+                  &pressed);
+  return true;
+}
+
+// The media key to send after a media key report, as the guidelines of Microsoft (see SPEC.md): the key newly pressed
+// (the first in the report if more than one), or none if the key sent has been released; otherwise the key sent
+static uint16_t chooseConsumerUsage(uint16_t sent, const PressedConsumerKeys &before, const PressedConsumerKeys &now) {
+  for (uint8_t i = 0; i < now.count; i++) {
+    if (!containsUsage(before.usages, before.count, now.usages[i])) {
+      return now.usages[i];
+    }
+  }
+  if (containsUsage(before.usages, before.count, sent) && !containsUsage(now.usages, now.count, sent)) {
+    return 0;
+  }
+  return sent;
+}
+
+// Send the queued reports one at a time whenever the host can take one: the keyboard reports on the keyboard, and the
+// media key reports on the settings HID. While the host is not ready (e.g. suspended), the reports are discarded
+static void sendReports() {
   if (!TinyUSBDevice.ready()) {
-    reportQueueCount = 0;
+    keyboardQueue.count = 0;
+    consumerQueue.count = 0;
     return;
   }
-  if (reportQueueCount == 0 || !keyboard.ready()) {
-    return;
+  if (keyboardQueue.count > 0 && keyboard.ready()) {
+    KeyboardReport report = keyboardQueue.front();
+    if (keyboard.keyboardReport(0, report.modifiers, report.keys)) {
+      keyboardQueue.pop();
+    }
   }
-  KeyboardReport &report = reportQueue[reportQueueHead];
-  if (keyboard.keyboardReport(0, report.modifiers, report.keys)) {
-    reportQueueHead = (reportQueueHead + 1) % KEYBOARD_REPORT_QUEUE_SIZE;
-    reportQueueCount--;
+  if (consumerQueue.count > 0 && settings.ready()) {
+    if (settings.sendReport16(CONSUMER_REPORT_ID, consumerQueue.front())) {
+      consumerQueue.pop();
+    }
   }
 }
 
@@ -1146,11 +1282,19 @@ static bool isUuid16(const String &uuid, const char *uuid16) {
          uuid.equalsIgnoreCase(String("0000") + uuid16 + "-0000-1000-8000-00805f9b34fb");
 }
 
-// The layout of the keyboard input report with the ID (NULL if the Report Map has none)
-static const KeyboardFormat *findKeyboardFormat(uint8_t reportId) {
-  for (size_t i = 0; i < keyboardFormatCount; i++) {
-    if (keyboardFormats[i].reportId == reportId) {
-      return &keyboardFormats[i];
+// Read the layouts of the keyboard input reports and of the media key reports from a Report Map
+static void parseHidFormats(uint8_t const *map, size_t size) {
+  keyboardFormatCount =
+      parseKeyFormats(map, size, COLLECTION_KEYBOARD, USAGE_PAGE_KEYBOARD, keyboardFormats, KEYBOARD_MAX_FORMATS);
+  consumerFormatCount = parseKeyFormats(map, size, COLLECTION_CONSUMER_CONTROL, USAGE_PAGE_CONSUMER, consumerFormats,
+                                        CONSUMER_MAX_FORMATS);
+}
+
+// The layout of the report with the ID among the layouts (NULL if there is none)
+static const KeyFormat *findKeyFormat(const KeyFormat *formats, size_t count, uint8_t reportId) {
+  for (size_t i = 0; i < count; i++) {
+    if (formats[i].reportId == reportId) {
+      return &formats[i];
     }
   }
   return NULL;
@@ -1175,6 +1319,7 @@ static bool askShortInterval(EspBleConnectionId id, uint16_t supervisionTimeout)
 // Discover the HID service with EspBle (the first step without a remembered HID service)
 static void startHidDiscovery() {
   hidStep = HID_STEP_DISCOVER;
+  hidCheckReports = false;
   hidReportMapSize = 0;
   if (!ble.discoverServices(hidConnectionId)) {
     failHidPreparation(false);
@@ -1238,8 +1383,8 @@ static bool findHidReports() {
   return hidReportMapHandle != 0 && hidReportCount > 0;
 }
 
-// What to remember of the HID service just discovered: the keyboard input reports and the Report Map. The address is
-// set when it is saved (false if it cannot be kept)
+// What to remember of the HID service just discovered: the keyboard input reports, the media key reports and the Report
+// Map. The address is set when it is saved (false if it cannot be kept)
 static bool buildHidCache(HidCache &cache) {
   memset(&cache, 0, sizeof(cache));
   if (hidReportMapSize == 0) {
@@ -1247,10 +1392,10 @@ static bool buildHidCache(HidCache &cache) {
   }
   for (size_t i = 0; i < hidReportCount; i++) {
     const HidReport &report = hidReports[i];
-    if (report.keyboard == NULL) {
+    if (report.keyboard == NULL && report.consumer == NULL) {
       continue;
     }
-    if (cache.reportCount >= KEYBOARD_MAX_FORMATS) {
+    if (cache.reportCount >= HID_CACHE_MAX_REPORTS) {
       return false;
     }
     cache.reports[cache.reportCount++] = {report.handle, report.cccdHandle, report.referenceHandle, report.id};
@@ -1266,8 +1411,7 @@ static bool buildHidCache(HidCache &cache) {
 
 // Take the remembered HID service as the one to prepare (false if its Report Map has no layout for a report)
 static bool useHidCache() {
-  keyboardFormatCount = parseKeyboardFormats(hidCache.reportMap, hidCache.reportMapSize, keyboardFormats,
-                                             KEYBOARD_MAX_FORMATS);
+  parseHidFormats(hidCache.reportMap, hidCache.reportMapSize);
   hidReportCount = 0;
   for (size_t i = 0; i < hidCache.reportCount; i++) {
     const CachedReport &cached = hidCache.reports[i];
@@ -1279,8 +1423,9 @@ static bool useHidCache() {
     report.notifiable = true;
     report.id = cached.id;
     report.type = REPORT_TYPE_INPUT;
-    report.keyboard = findKeyboardFormat(cached.id);
-    if (report.keyboard == NULL) {
+    report.keyboard = findKeyFormat(keyboardFormats, keyboardFormatCount, cached.id);
+    report.consumer = findKeyFormat(consumerFormats, consumerFormatCount, cached.id);
+    if (report.keyboard == NULL && report.consumer == NULL) {
       return false;
     }
   }
@@ -1288,8 +1433,14 @@ static bool useHidCache() {
 }
 
 // The remembered HID service is not that of the keyboard: discover it as on the first connection, and remember it again
-// when the relay starts
+// when the relay starts. Once relaying, forget it and close the connection instead, so that the next connection
+// discovers it without stopping the relay in the middle (see SPEC.md)
 static void rediscoverHidService() {
+  if (hidConsumerPhase) {
+    forgetHidCache();
+    failHidPreparation(false);
+    return;
+  }
   keyboardUsesCache = false;
   if (!keyboardShortInterval) {
     keyboardShortInterval = askShortInterval(keyboardConnectionId, keyboardSupervisionTimeout);
@@ -1373,7 +1524,6 @@ static int onNimbleAttribute(uint16_t connectionHandle, const struct ble_gatt_er
 // The relay starts. The parameters of the connection are put back if they were changed for the preparation, and the
 // HID service is remembered if it was discovered
 static void startRelaying() {
-  hidStep = HID_STEP_NONE;
   keyboardReady = true;
   // So that the relay runs as before the preparation was shortened
   if (keyboardShortInterval) {
@@ -1388,14 +1538,48 @@ static void startRelaying() {
   }
 }
 
-// Subscribe to the next keyboard input report by writing its Client Characteristic Configuration; relaying when all
-// are subscribed
-static void subscribeNextKeyboardReport() {
-  while (hidStepIndex < hidReportCount && hidReports[hidStepIndex].keyboard == NULL) {
+// Whether the Report is prepared in the current phase: the keyboard input reports, then the media key reports (a
+// report with both is prepared with the keyboard input reports)
+static bool isPhaseReport(const HidReport &report) {
+  return hidConsumerPhase ? report.keyboard == NULL && report.consumer != NULL : report.keyboard != NULL;
+}
+
+// Skip to the next Report of the current phase
+static void skipToPhaseReport() {
+  while (hidStepIndex < hidReportCount && !isPhaseReport(hidReports[hidStepIndex])) {
     hidStepIndex++;
   }
+}
+
+// Prepare the Reports of the current phase: check them first if they are the remembered ones, then subscribe
+static void prepareReports() {
+  hidStepIndex = 0;
+  if (hidCheckReports) {
+    checkNextCachedReport();
+  } else {
+    subscribeReports();
+  }
+}
+
+// Subscribe to the Reports of the current phase
+static void subscribeReports() {
+  hidStep = HID_STEP_SUBSCRIBE;
+  hidStepIndex = 0;
+  subscribeNextReport();
+}
+
+// Subscribe to the next Report of the current phase by writing its Client Characteristic Configuration. When all the
+// keyboard input reports are subscribed, the relay starts and the media key reports are prepared (see SPEC.md)
+static void subscribeNextReport() {
+  skipToPhaseReport();
   if (hidStepIndex >= hidReportCount) {
+    if (hidConsumerPhase) {
+      hidStep = HID_STEP_NONE;
+      return;
+    }
     startRelaying();
+    hidConsumerPhase = true;
+    prepareReports();
     return;
   }
   static const uint8_t NOTIFICATIONS_ENABLED[] = {0x01, 0x00};
@@ -1406,13 +1590,12 @@ static void subscribeNextKeyboardReport() {
   }
 }
 
-// Check the next remembered keyboard input report: the descriptors at its handles, then its Report Reference.
+// Check the next remembered Report of the current phase: the descriptors at its handles, then its Report Reference.
 // Subscribe when all are as remembered
 static void checkNextCachedReport() {
+  skipToPhaseReport();
   if (hidStepIndex >= hidReportCount) {
-    hidStep = HID_STEP_SUBSCRIBE;
-    hidStepIndex = 0;
-    subscribeNextKeyboardReport();
+    subscribeReports();
     return;
   }
   const HidReport &report = hidReports[hidStepIndex];
@@ -1439,9 +1622,10 @@ static void relayPairingConnection(const EspBleBond &registered) {
   keyboardSupervisionTimeout = pairingConnection.supervisionTimeout;
   pairingConnectionId = 0;
   hidForPairing = false;
-  hidStep = HID_STEP_SUBSCRIBE;
-  hidStepIndex = 0;
-  subscribeNextKeyboardReport();
+  // The Report References have just been read while pairing
+  hidCheckReports = false;
+  hidConsumerPhase = false;
+  subscribeReports();
 }
 
 // The HID service of the device paired with is found: remember it, replace the registration, and relay on this
@@ -1459,8 +1643,8 @@ static void finishPairingPreparation() {
   relayPairingConnection(registered);
 }
 
-// Read the Report Reference of the next notifiable Report that has one (the others cannot be keyboard input reports).
-// When all are read, subscribe to the keyboard input reports, or end the pairing
+// Read the Report Reference of the next notifiable Report that has one (the others cannot be keyboard input reports or
+// media key reports). When all are read, subscribe to the Reports, or end the pairing
 static void readNextReportReference() {
   while (hidStepIndex < hidReportCount &&
          (hidReports[hidStepIndex].referenceHandle == 0 || !hidReports[hidStepIndex].notifiable)) {
@@ -1484,9 +1668,7 @@ static void readNextReportReference() {
     finishPairingPreparation();
     return;
   }
-  hidStep = HID_STEP_SUBSCRIBE;
-  hidStepIndex = 0;
-  subscribeNextKeyboardReport();
+  subscribeReports();
 }
 
 // A result of a NimBLE GATT operation of the preparation
@@ -1495,7 +1677,7 @@ static void onNimbleResult(const NimbleEvent &event) {
       hidStepIndex >= hidReportCount) {
     return;
   }
-  const HidReport &report = hidReports[hidStepIndex];
+  HidReport &report = hidReports[hidStepIndex];
   switch (hidStep) {
     case HID_STEP_CHECK_DESCRIPTORS:
       if (event.type == NIMBLE_DESCRIPTOR) {
@@ -1528,28 +1710,43 @@ static void onNimbleResult(const NimbleEvent &event) {
         failHidPreparation(false);
         return;
       }
+      report.subscribed = true;
       hidStepIndex++;
-      subscribeNextKeyboardReport();
+      subscribeNextReport();
       return;
     default:
       return;
   }
 }
 
-// Relay a keyboard input report of the registered keyboard as a boot keyboard report (see SPEC.md). Only the
-// connection encrypted with the bond gets ready to relay
+// Relay a media key report: send the media key chosen as the guidelines of Microsoft (see SPEC.md)
+static void relayConsumerReport(HidReport &hidReport, uint8_t const *data, size_t length) {
+  PressedConsumerKeys pressed;
+  if (!readConsumerReport(*hidReport.consumer, data, length, pressed)) {
+    return;
+  }
+  consumerQueue.push(chooseConsumerUsage(consumerQueue.last, hidReport.consumerPressed, pressed));
+  hidReport.consumerPressed = pressed;
+}
+
+// Relay a keyboard input report of the registered keyboard as a boot keyboard report, and a media key report as the
+// media key (see SPEC.md). Only the connection encrypted with the bond gets ready to relay, and only the Reports
+// subscribed to after their handles have been checked are relayed (a bonded keyboard may notify before that)
 static void relayNotification(const NimbleEvent &event) {
-  if (!keyboardReady || event.connectionHandle != keyboardConnectionHandle) {
+  if (!keyboardReady || event.connectionHandle != keyboardConnectionHandle || event.status != 0) {
     return;
   }
   for (size_t i = 0; i < hidReportCount; i++) {
-    const HidReport &hidReport = hidReports[i];
-    if (hidReport.handle != event.handle || hidReport.keyboard == NULL) {
+    HidReport &hidReport = hidReports[i];
+    if (hidReport.handle != event.handle || !hidReport.subscribed) {
       continue;
     }
     KeyboardReport report;
-    if (event.status == 0 && readKeyboardReport(*hidReport.keyboard, event.data, event.length, report)) {
-      queueKeyboardReport(report);
+    if (hidReport.keyboard != NULL && readKeyboardReport(*hidReport.keyboard, event.data, event.length, report)) {
+      keyboardQueue.push(report);
+    }
+    if (hidReport.consumer != NULL) {
+      relayConsumerReport(hidReport, event.data, event.length);
     }
     return;
   }
@@ -1603,13 +1800,14 @@ static void onKeyboardSecurityChanged(const EspBleSecurityChanged &event) {
   }
   hidConnectionId = keyboardConnectionId;
   hidForPairing = false;
+  hidConsumerPhase = false;
   if (!keyboardUsesCache) {
     startHidDiscovery();
   } else if (!useHidCache()) {
     rediscoverHidService();
   } else {
-    hidStepIndex = 0;
-    checkNextCachedReport();
+    hidCheckReports = true;
+    prepareReports();
   }
 }
 
@@ -1633,8 +1831,8 @@ static void onServicesDiscovered(const EspBleGattResult &result) {
   }
 }
 
-// The Report Map is read: keep it to be remembered, find the layout of the keyboard input reports, then read the Report
-// References. Without a keyboard input in the Report Map, the device is not a keyboard
+// The Report Map is read: keep it to be remembered, find the layout of the keyboard input reports and of the media key
+// reports, then read the Report References. Without a keyboard input in the Report Map, the device is not a keyboard
 static void onCharacteristicRead(const EspBleGattResult &result) {
   if (hidStep != HID_STEP_READ_REPORT_MAP || result.connectionId != hidConnectionId ||
       result.handle != hidReportMapHandle) {
@@ -1647,7 +1845,7 @@ static void onCharacteristicRead(const EspBleGattResult &result) {
   uint8_t const *map = reinterpret_cast<uint8_t const *>(result.value.c_str());
   hidReportMapSize = result.value.length() <= REPORT_MAP_MAX_SIZE ? result.value.length() : 0;
   memcpy(hidReportMap, map, hidReportMapSize);
-  keyboardFormatCount = parseKeyboardFormats(map, result.value.length(), keyboardFormats, KEYBOARD_MAX_FORMATS);
+  parseHidFormats(map, result.value.length());
   if (keyboardFormatCount == 0) {
     failHidPreparation(true);
     return;
@@ -1657,8 +1855,8 @@ static void onCharacteristicRead(const EspBleGattResult &result) {
   readNextReportReference();
 }
 
-// A Report Reference is read: the Report is a keyboard input report if it is an input report with the ID of one in
-// the Report Map, and can be subscribed to
+// A Report Reference is read: the Report is a keyboard input report or a media key report if it is an input report with
+// the ID of one in the Report Map, and can be subscribed to
 static void onDescriptorRead(const EspBleGattResult &result) {
   if (hidStep != HID_STEP_READ_REFERENCE || result.connectionId != hidConnectionId ||
       hidStepIndex >= hidReportCount || result.descriptorHandle != hidReports[hidStepIndex].referenceHandle) {
@@ -1671,14 +1869,14 @@ static void onDescriptorRead(const EspBleGattResult &result) {
   HidReport &report = hidReports[hidStepIndex];
   report.id = static_cast<uint8_t>(result.value[0]);
   report.type = static_cast<uint8_t>(result.value[1]);
-  report.keyboard = report.type == REPORT_TYPE_INPUT && report.notifiable && report.cccdHandle != 0
-                        ? findKeyboardFormat(report.id)
-                        : NULL;
+  bool input = report.type == REPORT_TYPE_INPUT && report.notifiable && report.cccdHandle != 0;
+  report.keyboard = input ? findKeyFormat(keyboardFormats, keyboardFormatCount, report.id) : NULL;
+  report.consumer = input ? findKeyFormat(consumerFormats, consumerFormatCount, report.id) : NULL;
   hidStepIndex++;
   readNextReportReference();
 }
 
-// The connection to the registered keyboard is closed: release every key on the host
+// The connection to the registered keyboard is closed: release every key and media key on the host
 static void onKeyboardDisconnected(const EspBleConnection &connection) {
   keyboardConnectionId = 0;
   keyboardReady = false;
@@ -1686,8 +1884,10 @@ static void onKeyboardDisconnected(const EspBleConnection &connection) {
     hidConnectionId = 0;
     hidStep = HID_STEP_NONE;
   }
+  hidConsumerPhase = false;
   hidReportCount = 0;
-  queueKeyboardReport(KeyboardReport{});
+  keyboardQueue.push(KeyboardReport{});
+  consumerQueue.push(0);
 }
 
 // Events of the connections, for the registered keyboard or for the device to pair with. Only one attempt to connect
@@ -1906,7 +2106,7 @@ void loop() {
   }
   preparePairing();
   connectKeyboard();
-  sendKeyboardReports();
+  sendReports();
 
   delay(LOOP_INTERVAL_MS);
 }
