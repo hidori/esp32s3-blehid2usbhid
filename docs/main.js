@@ -10,7 +10,6 @@ const restartButton = document.getElementById("restart");
 const keyboardCard = document.getElementById("keyboard-card");
 const keyboardMessage = document.getElementById("keyboard-message");
 const registrationName = document.getElementById("registration-name");
-const registrationAddress = document.getElementById("registration-address");
 const registrationState = document.getElementById("registration-state");
 const registrationDeleteButton = document.getElementById("registration-delete");
 const scanButton = document.getElementById("scan");
@@ -66,6 +65,9 @@ const KEYBOARD_STATE_NAMES = new Map([
   [KEYBOARD_RELAYING, "中継しています"],
 ]);
 
+// Shown in place of the name of a keyboard whose name is not known
+const UNKNOWN_NAME = "名称不明";
+
 // Time to wait for a response from the device
 const RESPONSE_TIMEOUT_MS = 1000;
 
@@ -87,7 +89,7 @@ let scanState = "idle";
 // Changed when the search shown on the page is abandoned, so that its loop stops
 let scanSession = 0;
 
-// Rows of the search result table: { tr, nameCell, addressCell, rssiCell, pairButton, found }
+// Rows of the search result table: { tr, nameCell, rssiCell, pairButton, found }
 const scanRows = [];
 
 // Pairing shown on the page: null while not pairing, or { name, state, passkey, cancelRequested }
@@ -96,7 +98,7 @@ let pairing = null;
 let pairingSession = 0;
 
 // Registration shown on the page: null before it is read, { error }, { registered: false }, or
-// { registered: true, address, state, name }
+// { registered: true, state, name }
 let registration = null;
 // Changed when the registration shown on the page is abandoned, so that its loop stops
 let registrationSession = 0;
@@ -176,10 +178,8 @@ function renderRegistration() {
   } else if (!registered) {
     registrationName.textContent = "未登録";
   } else {
-    registrationName.textContent = registration.name || "（名前なし）";
+    registrationName.textContent = registration.name || UNKNOWN_NAME;
   }
-  registrationAddress.hidden = !registered;
-  registrationAddress.textContent = registered ? registration.address : "";
   registrationState.hidden = !registered;
   if (registered) {
     registrationState.textContent =
@@ -253,11 +253,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Format an address received in little endian as AA:BB:CC:DD:EE:FF
-function formatAddress(bytes) {
-  return [...bytes].reverse().map(hex2).join(":");
-}
-
 // Read the device at the index in the search result (see SPEC.md); found is null if the index is past the end
 async function readScanResult(index) {
   const response = await request(COMMAND_GET_SCAN_RESULT, Uint8Array.of(index));
@@ -274,7 +269,6 @@ async function readScanResult(index) {
   const found = {
     addressType: data.getUint8(2),
     addressBytes: bytes(3, 6).slice(),
-    address: formatAddress(bytes(3, 6)),
     rssi: data.getInt8(9),
     name: utf8.decode(bytes(11, data.getUint8(10))),
   };
@@ -296,8 +290,6 @@ async function readScanResults() {
 // Add a row to the search result table
 function addScanRow() {
   const nameCell = document.createElement("td");
-  const addressCell = document.createElement("td");
-  addressCell.className = "address";
   const rssiCell = document.createElement("td");
   rssiCell.className = "rssi";
   const pairButton = document.createElement("button");
@@ -308,10 +300,10 @@ function addScanRow() {
   operationCell.className = "operation";
   operationCell.append(pairButton);
   const tr = document.createElement("tr");
-  tr.append(nameCell, addressCell, rssiCell, operationCell);
+  tr.append(nameCell, rssiCell, operationCell);
   scanDevicesBody.append(tr);
 
-  const row = { tr, nameCell, addressCell, rssiCell, pairButton, found: null };
+  const row = { tr, nameCell, rssiCell, pairButton, found: null };
   pairButton.addEventListener("click", () => {
     startPairing(row.found).catch((error) => showError(keyboardMessage, error));
   });
@@ -325,9 +317,8 @@ function showScanResults(devices) {
   devices.forEach((found, i) => {
     const row = scanRows[i] ?? addScanRow();
     row.found = found;
-    row.nameCell.textContent = found.name || "（名前なし）";
+    row.nameCell.textContent = found.name || UNKNOWN_NAME;
     row.nameCell.classList.toggle("no-name", !found.name);
-    row.addressCell.textContent = found.address;
     row.rssiCell.textContent = `${found.rssi} dBm`;
   });
   for (const row of scanRows.splice(devices.length)) {
@@ -415,7 +406,6 @@ async function readRegistration() {
   const bytes = (offset, size) => new Uint8Array(data.buffer, data.byteOffset + offset, size);
   return {
     registered: true,
-    address: formatAddress(bytes(2, 6)),
     state: data.getUint8(8),
     name: utf8.decode(bytes(10, data.getUint8(9))),
   };
@@ -453,7 +443,7 @@ function clearRegistration() {
 // Delete the registration once the user confirms it, and show the progress until it is gone (the device deletes it
 // after the response, see SPEC.md)
 async function deleteRegistration() {
-  const name = registration.name || registration.address;
+  const name = registration.name || UNKNOWN_NAME;
   const question = `${name} の登録を削除しますか？\n削除すると、この BLE キーボードを使うには、ペアリングし直す必要があります。`;
   if (!confirm(question)) {
     return;
@@ -567,7 +557,7 @@ async function startPairing(found) {
   scanSession++;
   scanState = "idle";
   const session = ++pairingSession;
-  const name = found.name || found.address;
+  const name = found.name || UNKNOWN_NAME;
   pairing = { name, state: PAIRING_CONNECTING, passkey: 0, cancelRequested: false };
   showMessage(keyboardMessage, "");
   render();

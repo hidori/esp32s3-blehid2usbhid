@@ -327,17 +327,6 @@ button:focus-visible {
   margin: 0 0 1rem;
 }
 
-.registration-label {
-  color: var(--muted);
-  font-size: 0.8125rem;
-  font-weight: 600;
-}
-
-.registration .address {
-  color: var(--muted);
-  font-family: ui-monospace, Consolas, monospace;
-}
-
 .registration .no-name {
   color: var(--muted);
 }
@@ -380,11 +369,6 @@ button:focus-visible {
 
 .devices tbody tr:last-child td {
   border-bottom: none;
-}
-
-.devices .address {
-  font-family: ui-monospace, Consolas, monospace;
-  white-space: nowrap;
 }
 
 .devices .rssi {
