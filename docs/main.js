@@ -217,7 +217,7 @@ function request(command, args = new Uint8Array(0)) {
   const target = device;
   // Disconnected meanwhile (e.g. between the requests of the search)
   if (target === null) {
-    return Promise.reject(new Error("デバイスが接続されていません"));
+    return Promise.reject(new Error("ブリッジが接続されていません"));
   }
   return new Promise((resolve, reject) => {
     let timer;
@@ -234,7 +234,7 @@ function request(command, args = new Uint8Array(0)) {
     };
     timer = setTimeout(() => {
       finish();
-      reject(new Error("デバイスから応答がありません"));
+      reject(new Error("ブリッジから応答がありません"));
     }, RESPONSE_TIMEOUT_MS);
     target.addEventListener("inputreport", onInputReport);
 

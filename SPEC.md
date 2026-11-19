@@ -131,7 +131,7 @@ RGB LED で、ブリッジ全体の状況を 1 つ示す。
 
 ## 設定用 HID の通信
 
-設定用 Web ページとデバイスの間のやり取りを定める。
+設定用 Web ページとブリッジの間のやり取りを定める。
 
 - 設定用 HID のベンダー定義コレクション（Usage Page 0xFF00、Usage 0x01）の、Report ID 2 を使う
 - 要求は Output Report、応答は Input Report で送る。どちらも Report ID を除いて 63 バイト
