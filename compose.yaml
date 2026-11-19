@@ -19,7 +19,7 @@ services:
 
   # Playwright MCP server, with a stub of the device in place of WebHID
   mcp-playwright:
-    image: mcr.microsoft.com/playwright/mcp:v0.0.85
+    image: mcr.microsoft.com/playwright/mcp:v0.0.86
     networks:
       - mcp-playwright
     init: true
