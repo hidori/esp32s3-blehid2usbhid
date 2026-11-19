@@ -21,3 +21,6 @@ void setupBle();
 // Run the BLE side: the events, the search, the pairing, the deletion of the registration, the connection to the
 // registered keyboard and the lamps (called in loop())
 void updateBle();
+
+// Whether the start has failed: the NVS could not be initialized, or BLE could not be started
+bool hasBleFailed();

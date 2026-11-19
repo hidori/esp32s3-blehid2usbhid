@@ -1,6 +1,7 @@
 // BLE HID to USB HID bridge
 
 #include "src/ble/ble.h"
+#include "src/led/led.h"
 #include "src/settings/settings.h"
 #include "src/usb/usb.h"
 
@@ -8,6 +9,7 @@
 const uint32_t LOOP_INTERVAL_MS = 1;
 
 void setup() {
+  setupLed();
   setupUsb();
   setupBle();
 }
@@ -20,6 +22,7 @@ void loop() {
 
   updateBle();
   sendReports();
+  updateLed();
 
   delay(LOOP_INTERVAL_MS);
 }

@@ -8,9 +8,12 @@
 
 EspBle ble;
 
+// The NVS could not be initialized, or BLE could not be started
+static bool bleFailed;
+
 void setupBle() {
   // Before anything else uses the NVS (the BLE bonds are kept there)
-  initNvs();
+  bool nvsReady = initNvs();
   loadKeyboardName();
   loadHidCache();
 
@@ -22,7 +25,8 @@ void setupBle() {
   config.security.mitm = true;
   config.security.ioCapability = EspBleSecurityIoCapability::DisplayOnly;
   // The scan results and the events of the connections are delivered from ble.update() in updateBle()
-  ble.begin(config);
+  bool started = ble.begin(config);
+  bleFailed = !nvsReady || !started;
   setupGatt();
   setupScan();
   setupConnection();
@@ -38,4 +42,8 @@ void updateBle() {
   deleteRegistration();
   connectKeyboard();
   writeLamps();
+}
+
+bool hasBleFailed() {
+  return bleFailed;
 }
