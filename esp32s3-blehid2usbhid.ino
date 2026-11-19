@@ -21,6 +21,7 @@ const uint8_t COMMAND_START_PAIRING = 0x07;
 const uint8_t COMMAND_CANCEL_PAIRING = 0x08;
 const uint8_t COMMAND_GET_PAIRING_STATE = 0x09;
 const uint8_t COMMAND_GET_REGISTRATION = 0x0A;
+const uint8_t COMMAND_DELETE_REGISTRATION = 0x0B;
 const uint8_t RESULT_SUCCESS = 0x00;
 const uint8_t RESULT_UNKNOWN_COMMAND = 0x01;
 const uint8_t RESULT_INVALID_ARGUMENT = 0x02;
@@ -206,6 +207,9 @@ static const size_t KEYBOARD_NAME_HEADER_SIZE = offsetof(KeyboardName, name);
 
 // Search requested while an attempt to connect to the registered keyboard is in progress (started when it ends)
 static bool scanRequested;
+
+// Deletion of the registration requested: done once there is neither a connection nor an attempt to connect
+static bool registrationDeleting;
 
 // Connection to the registered keyboard, whose input is relayed to the host (see SPEC.md)
 static bool keyboardConnecting;                  // An attempt to connect is in progress
@@ -474,6 +478,16 @@ static bool saveKeyboardName(const EspBleBond &bond, const char *name, size_t na
     keyboardName = saved;
   }
   return written;
+}
+
+// Forget the name of the registered keyboard
+static void forgetKeyboardName() {
+  keyboardName = {};
+  Preferences prefs;
+  if (prefs.begin(NVS_NAMESPACE, false)) {
+    prefs.remove(NVS_KEY_KEYBOARD);
+    prefs.end();
+  }
 }
 
 // Load the remembered HID service from the NVS (none if it is missing, broken or of another layout)
@@ -760,7 +774,7 @@ static bool deletePairingBond() {
 // Start pairing with the device in the scan result (see SPEC.md). The connection is made in loop() by
 // preparePairing(), after the relay has stopped
 static uint8_t startPairing(uint8_t const *args) {
-  if (isPairing()) {
+  if (isPairing() || registrationDeleting) {
     return RESULT_BLE_FAILED;
   }
   const ScannedDevice *device = findScannedDevice(args[0], args + 1);
@@ -918,9 +932,10 @@ static bool readRegisteredKeyboard(EspBleBond &keyboard) {
   return true;
 }
 
-// Keep trying to connect to the registered keyboard, but not while searching or pairing (see SPEC.md)
+// Keep trying to connect to the registered keyboard, but not while searching, pairing or deleting the registration (see
+// SPEC.md)
 static void connectKeyboard() {
-  if (keyboardConnecting || keyboardConnectionId != 0 || isPairing() || isScanning()) {
+  if (keyboardConnecting || keyboardConnectionId != 0 || isPairing() || isScanning() || registrationDeleting) {
     return;
   }
   EspBleBond registered;
@@ -930,6 +945,32 @@ static void connectKeyboard() {
   keyboardTarget = registered;
   keyboardConnecting =
       ble.connect(registered.peerAddress.c_str(), registered.peerAddressType, KEYBOARD_CONNECT_ATTEMPT_MS);
+}
+
+// Start deleting the registration (see SPEC.md): close the connection to the registered keyboard. The registration is
+// deleted in loop() by deleteRegistration(), once there is neither a connection nor an attempt to connect
+static uint8_t startRegistrationDeletion() {
+  if (isPairing()) {
+    return RESULT_BLE_FAILED;
+  }
+  registrationDeleting = true;
+  if (keyboardConnectionId != 0) {
+    ble.disconnect(keyboardConnectionId);
+  }
+  return RESULT_SUCCESS;
+}
+
+// Delete the registration once there is neither a connection nor an attempt to connect: all the bonds, and the name
+// and the HID service saved with the registration. A connection made after the bond has been deleted would start a
+// pairing, so an attempt to connect is waited for (see SPEC.md)
+static void deleteRegistration() {
+  if (!registrationDeleting || keyboardConnecting || keyboardConnectionId != 0 || ble.connectionCount() != 0) {
+    return;
+  }
+  registrationDeleting = false;
+  ble.deleteAllBonds();
+  forgetKeyboardName();
+  forgetHidCache();
 }
 
 // Value of a field of a HID report, least significant bit first
@@ -1925,15 +1966,15 @@ static void handleNimbleEvents() {
 
 // Connected to the registered keyboard; the encryption with the bond starts by itself (pairOnConnect). Without a
 // remembered HID service, ask for a short connection interval for its discovery. A remembered one needs only a few
-// round trips, which end before a new interval would take effect. If the pairing has started during the attempt, close
-// the connection so that the pairing can go on
+// round trips, which end before a new interval would take effect. If the pairing or the deletion of the registration
+// has started during the attempt, close the connection so that it can go on
 static void onKeyboardConnected(const EspBleConnection &connection) {
   keyboardConnectionId = connection.id;
   keyboardConnectionHandle = connection.handle;
   keyboardReady = false;
   writtenLamps = -1;
   keyboardShortInterval = false;
-  if (isPairing()) {
+  if (isPairing() || registrationDeleting) {
     ble.disconnect(connection.id);
     return;
   }
@@ -2184,6 +2225,9 @@ static void handleSettingsRequest(uint8_t const *request) {
     case COMMAND_GET_REGISTRATION:
       sendRegistration(command);
       break;
+    case COMMAND_DELETE_REGISTRATION:
+      sendSettingsResponse(command, startRegistrationDeletion(), NULL, 0);
+      break;
     default:
       sendSettingsResponse(command, RESULT_UNKNOWN_COMMAND, NULL, 0);
       break;
@@ -2263,6 +2307,7 @@ void loop() {
     beginScan();
   }
   preparePairing();
+  deleteRegistration();
   connectKeyboard();
   sendReports();
   writeLamps();

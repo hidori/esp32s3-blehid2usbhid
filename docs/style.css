@@ -291,6 +291,11 @@ button:focus-visible {
   color: var(--muted);
 }
 
+/* Deletion of the registration, at the end of the line */
+.registration button {
+  margin-left: auto;
+}
+
 /* Search result table */
 
 .table-wrap {

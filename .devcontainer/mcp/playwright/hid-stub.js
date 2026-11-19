@@ -18,6 +18,7 @@
   const COMMAND_CANCEL_PAIRING = 0x08;
   const COMMAND_GET_PAIRING_STATE = 0x09;
   const COMMAND_GET_REGISTRATION = 0x0a;
+  const COMMAND_DELETE_REGISTRATION = 0x0b;
   const RESULT_SUCCESS = 0x00;
   const RESULT_UNKNOWN_COMMAND = 0x01;
   const RESULT_INVALID_ARGUMENT = 0x02;
@@ -122,6 +123,9 @@
   const RELAY_START_MS = 300;
   const RECONNECT_MS = 1500;
 
+  // Time until the registration is deleted after the request (the connection to the keyboard is closed first)
+  const DELETION_MS = 500;
+
   // Search: when it started (null before the first search) and when it stopped (null while searching)
   let scanStartedMs = null;
   let scanStoppedMs = null;
@@ -133,6 +137,9 @@
   // Registered keyboard: { found, sinceMs, waitState, waitMs } (null if none). It survives a restart like the bonds in
   // the NVS. The connection is in waitState for waitMs after sinceMs, and relays after that
   let registered = null;
+
+  // When the requested deletion of the registration ends (null while none is in progress)
+  let deletionEndsMs = null;
 
   // Devices found by the search so far
   function scannedDevices() {
@@ -186,9 +193,12 @@
     return new Uint8Array(data.buffer);
   }
 
-  // Start pairing with the device in the scan result
+  // Start pairing with the device in the scan result (not while pairing or deleting the registration)
   function startPairing(args) {
-    if (isPairing()) {
+    // A pairing that has just succeeded has registered its device, even if the registration has not been read since
+    updateRegistered();
+    updateDeletion();
+    if (isPairing() || deletionEndsMs !== null) {
       return RESULT_BLE_FAILED;
     }
     const found = scannedDevices().find(
@@ -239,15 +249,34 @@
     pairing.registeredChecked = true;
   }
 
+  // Start deleting the registration like the firmware (not while pairing): it is deleted after DELETION_MS
+  function startRegistrationDeletion() {
+    if (isPairing()) {
+      return RESULT_BLE_FAILED;
+    }
+    updateRegistered();
+    deletionEndsMs = performance.now() + DELETION_MS;
+    return RESULT_SUCCESS;
+  }
+
+  // Delete the registration once the requested deletion has ended
+  function updateDeletion() {
+    if (deletionEndsMs !== null && performance.now() >= deletionEndsMs) {
+      registered = null;
+      deletionEndsMs = null;
+    }
+  }
+
   // Registration data like the firmware (see SPEC.md)
   function registrationData() {
     updateRegistered();
+    updateDeletion();
     if (registered === null) {
       return new Uint8Array([0]);
     }
     let state;
-    if (isPairing() || (scanStartedMs !== null && scanStoppedMs === null)) {
-      state = KEYBOARD_IDLE; // Not connected to while searching or pairing
+    if (isPairing() || (scanStartedMs !== null && scanStoppedMs === null) || deletionEndsMs !== null) {
+      state = KEYBOARD_IDLE; // Not connected to while searching, pairing or deleting the registration
     } else {
       state = performance.now() - registered.sinceMs < registered.waitMs ? registered.waitState : KEYBOARD_RELAYING;
     }
@@ -321,6 +350,9 @@
         case COMMAND_GET_REGISTRATION:
           this.respond(command, RESULT_SUCCESS, registrationData());
           break;
+        case COMMAND_DELETE_REGISTRATION:
+          this.respond(command, startRegistrationDeletion());
+          break;
         default:
           this.respond(command, RESULT_UNKNOWN_COMMAND);
           break;
@@ -344,8 +376,10 @@
     // The device goes away (like the restart of the firmware)
     disconnect() {
       this.opened = false;
-      // The search and the pairing end with the restart, as the firmware forgets them
+      // The search, the pairing and a deletion not yet done end with the restart, as the firmware forgets them
       updateRegistered();
+      updateDeletion();
+      deletionEndsMs = null;
       scanStartedMs = null;
       scanStoppedMs = null;
       pairing = null;

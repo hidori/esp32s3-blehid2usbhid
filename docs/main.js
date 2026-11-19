@@ -12,6 +12,7 @@ const keyboardMessage = document.getElementById("keyboard-message");
 const registrationName = document.getElementById("registration-name");
 const registrationAddress = document.getElementById("registration-address");
 const registrationState = document.getElementById("registration-state");
+const registrationDeleteButton = document.getElementById("registration-delete");
 const scanButton = document.getElementById("scan");
 const scanResults = document.getElementById("scan-results");
 const scanDevicesBody = document.getElementById("scan-devices");
@@ -35,6 +36,7 @@ const COMMAND_START_PAIRING = 0x07;
 const COMMAND_CANCEL_PAIRING = 0x08;
 const COMMAND_GET_PAIRING_STATE = 0x09;
 const COMMAND_GET_REGISTRATION = 0x0a;
+const COMMAND_DELETE_REGISTRATION = 0x0b;
 const RESULT_SUCCESS = 0x00;
 const RESULT_NAMES = new Map([
   [0x00, "成功"],
@@ -73,6 +75,10 @@ const POLL_INTERVAL_MS = 500;
 // Interval of reading the registration while connected
 const REGISTRATION_POLL_INTERVAL_MS = 1000;
 
+// Time to wait for the registration to be gone after its deletion has been accepted (the device closes the connection
+// to the keyboard first, which can take until the supervision timeout)
+const DELETION_TIMEOUT_MS = 10000;
+
 // The opened HID device (null while not connected)
 let device = null;
 
@@ -94,6 +100,11 @@ let pairingSession = 0;
 let registration = null;
 // Changed when the registration shown on the page is abandoned, so that its loop stops
 let registrationSession = 0;
+
+// Whether the deletion of the registration is in progress
+let deleting = false;
+// Changed when the deletion shown on the page is abandoned, so that its loop stops
+let deletionSession = 0;
 
 const utf8 = new TextDecoder();
 
@@ -121,12 +132,13 @@ function render() {
   connectButton.disabled = connected;
   disconnectButton.disabled = !connected;
   restartButton.disabled = !connected;
-  // BLE keyboards can be searched and paired only while connected, and not while pairing (see SPEC.md)
+  // BLE keyboards can be searched and paired only while connected, and not while pairing; not paired either while the
+  // registration is being deleted (see SPEC.md)
   keyboardCard.hidden = !connected;
   scanButton.textContent = scanState === "idle" ? "検索" : "停止";
   scanButton.disabled = !connected || scanState === "stopping" || pairing !== null;
   for (const row of scanRows) {
-    row.pairButton.disabled = !connected || scanState === "stopping" || pairing !== null;
+    row.pairButton.disabled = !connected || scanState === "stopping" || pairing !== null || deleting;
   }
   renderPairing();
   renderRegistration();
@@ -174,6 +186,9 @@ function renderRegistration() {
       KEYBOARD_STATE_NAMES.get(registration.state) ?? `不明な状態（0x${hex2(registration.state)}）`;
     registrationState.classList.toggle("connected", registration.state === KEYBOARD_RELAYING);
   }
+  // The registration cannot be deleted while pairing (see SPEC.md)
+  registrationDeleteButton.hidden = !registered;
+  registrationDeleteButton.disabled = pairing !== null || deleting;
 }
 
 // Show the result of an operation in the message area of its card (in red if it is an error)
@@ -435,6 +450,60 @@ function clearRegistration() {
   render();
 }
 
+// Delete the registration once the user confirms it, and show the progress until it is gone (the device deletes it
+// after the response, see SPEC.md)
+async function deleteRegistration() {
+  const name = registration.name || registration.address;
+  const question = `${name} の登録を削除しますか？\n削除すると、この BLE キーボードを使うには、ペアリングし直す必要があります。`;
+  if (!confirm(question)) {
+    return;
+  }
+  const response = await request(COMMAND_DELETE_REGISTRATION);
+  const result = response.getUint8(1);
+  if (result !== RESULT_SUCCESS) {
+    showResult(keyboardMessage, "登録の削除", result);
+    return;
+  }
+  const session = ++deletionSession;
+  deleting = true;
+  showMessage(keyboardMessage, `${name} の登録を削除しています…`);
+  render();
+  try {
+    const deadline = performance.now() + DELETION_TIMEOUT_MS;
+    for (;;) {
+      const latest = await readRegistration();
+      if (session !== deletionSession) {
+        return;
+      }
+      registration = latest;
+      if (!latest.registered) {
+        showMessage(keyboardMessage, `${name} の登録を削除しました`);
+        break;
+      }
+      if (performance.now() >= deadline) {
+        showMessage(keyboardMessage, `${name} の登録を削除できませんでした（登録が残っています）`, true);
+        break;
+      }
+      render();
+      await sleep(POLL_INTERVAL_MS);
+    }
+  } catch (error) {
+    if (session !== deletionSession) {
+      return;
+    }
+    showError(keyboardMessage, error);
+  }
+  deleting = false;
+  render();
+}
+
+// Abandon the deletion shown on the page
+function clearDeletion() {
+  deletionSession++;
+  deleting = false;
+  render();
+}
+
 // Read the pairing state (see SPEC.md)
 async function readPairingState() {
   const response = await request(COMMAND_GET_PAIRING_STATE);
@@ -575,6 +644,7 @@ async function disconnect() {
   device = null;
   showMessage(deviceMessage, "");
   clearRegistration();
+  clearDeletion();
   clearPairing();
   clearScan();
 }
@@ -596,11 +666,15 @@ if ("hid" in navigator) {
   pairingCancelButton.addEventListener("click", () => {
     cancelPairing().catch((error) => showError(keyboardMessage, error));
   });
+  registrationDeleteButton.addEventListener("click", () => {
+    deleteRegistration().catch((error) => showError(keyboardMessage, error));
+  });
   // The device was unplugged
   navigator.hid.addEventListener("disconnect", (event) => {
     if (event.device === device) {
       device = null;
       clearRegistration();
+      clearDeletion();
       clearPairing();
       clearScan();
     }
