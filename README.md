@@ -2,6 +2,8 @@
 
 BLE 接続キーボードを USB 接続で使用するためのブリッジです。
 
+BIOS セットアップや OS インストール時にも Bluetooth 接続のキーボードを USB 接続で使用することができます。
+
 ## ディレクトリ構成
 
 ```text
@@ -11,10 +13,10 @@ BLE 接続キーボードを USB 接続で使用するためのブリッジで�
 ├── .github/                   # GitHub の設定
 ├── .gitignore                 # git の除外設定
 ├── .mcp.json                  # MCP サーバーの設定
-├── AGENTS.md                  # コーディングエージェント向けの指示
-├── CLAUDE.md                  # Claude Code 向けの指示
+├── AGENTS.md                  # コーディングエージェント指示書
+├── CLAUDE.md                  # Claude Code 指示書
 ├── LICENSE                    # ライセンス条文
-├── Makefile                   # 作業用のタスク定義
+├── Makefile                   # 開発作業用のタスク定義
 ├── README.md                  # プロジェクトの主旨と概要（このファイル）
 ├── SPEC.md                    # プロジェクトターゲットの仕様書
 ├── TODO.md                    # プロジェクトの課題管理
