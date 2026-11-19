@@ -25,7 +25,8 @@ BIOS セットアップや OS インストール時にも Bluetooth 接続のキ
 ├── docs/                      # 設定用 Web ページ
 ├── esp32s3-blehid2usbhid.ino  # スケッチ本体
 ├── mise.toml                  # mise の設定
-└── renovate.json              # Renovate の設定
+├── renovate.json              # Renovate の設定
+└── src/                       # スケッチの各部（責務ごとのフォルダに分けたもの）
 ```
 
 ## ライセンス
