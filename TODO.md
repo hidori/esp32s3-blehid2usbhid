@@ -7,9 +7,10 @@
 ## 保留事項
 
 - BLE マウスの中継
-- M5AtomS3/AtomS3R 対応
+- M5AtomS3 対応
+- M5AtomS3R 対応
 - M5CoreS3 対応
 - M5StampS3 対応
 - M5StickS3 対応
 - XIAO ESP32S3 対応
-- キー入力で PC をスリープから起こす機能（USB のリモートウェイクアップ）
+- USB のリモートウェイクアップ対応
