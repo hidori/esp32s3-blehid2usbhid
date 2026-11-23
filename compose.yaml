@@ -1,6 +1,6 @@
 services:
   web:
-    image: nginx:1.31.9-alpine
+    image: nginx:1.31.10-alpine
     ports:
       - "127.0.0.1:8080:80"
     volumes:
@@ -8,7 +8,7 @@ services:
 
   # Gateway to the MCP servers on the isolated networks (published only on 127.0.0.1)
   mcp-gateway:
-    image: nginx:1.31.9-alpine
+    image: nginx:1.31.10-alpine
     ports:
       - "127.0.0.1:8931:8080"
     networks:
@@ -41,7 +41,7 @@ services:
 
   # Serves docs/ on localhost in the network of mcp-playwright (WebHID needs a secure context)
   mcp-playwright-docs:
-    image: nginx:1.31.9-alpine
+    image: nginx:1.31.10-alpine
     network_mode: "service:mcp-playwright"
     volumes:
       - ./docs:/usr/share/nginx/html:ro
